@@ -10,7 +10,8 @@ name = "gpr_studio"
 path = "src/main.rs"
 
 [dependencies]
-eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+# Explicit window backends are required on Linux when default features are disabled.
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.31"
 rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["png"] }
