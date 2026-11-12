@@ -1,0 +1,54 @@
+name: Linux
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential pkg-config libwayland-dev libxkbcommon-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libgl1-mesa-dri xvfb xauth
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the standard release configuration
+        run: cargo build --locked --release
+
+      - name: Check processing, project reload and exports without a display
+        run: env -u DISPLAY -u WAYLAND_DISPLAY ./target/release/gpr_studio --selftest selftest_out
+
+      - name: Check X11 startup and rendering with software OpenGL
+        run: |
+          env -u WAYLAND_DISPLAY LIBGL_ALWAYS_SOFTWARE=1 timeout 90s \
+            xvfb-run -a -s "-screen 0 1600x1000x24" \
+            ./target/release/gpr_studio --screenshot selftest_out/linux-x11.png
+          test -s selftest_out/linux-x11.png
+
+      - name: Upload self-test outputs and screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-selftest
+          path: selftest_out/
+          if-no-files-found: ignore
+          retention-days: 7
