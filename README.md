@@ -26,10 +26,45 @@ Requires a recent stable Rust toolchain (https://rustup.rs). On Windows the MSVC
 (SQLite for the GeoPackage export is compiled from source).
 
 ```
-cargo build --release
+cargo build --locked --release
 ```
 
 The program is `target/release/gpr_studio` (`gpr_studio.exe` on Windows).
+
+### Linux
+
+Both **Wayland and X11** are enabled in the standard build. The application uses OpenGL;
+run it from a graphical desktop session with a working graphics driver (Mesa is supported).
+
+Install the native build dependencies first. For Debian/Ubuntu:
+
+```sh
+sudo apt-get update
+sudo apt-get install build-essential pkg-config libwayland-dev libxkbcommon-dev libgl1-mesa-dev libegl1-mesa-dev
+cargo build --locked --release
+./target/release/gpr_studio
+```
+
+File and folder dialogs use **XDG Desktop Portal**. Make sure `xdg-desktop-portal` and
+the backend for your desktop are installed and running in your user session, for example
+`xdg-desktop-portal-gtk` on a GTK desktop or `xdg-desktop-portal-kde` on KDE Plasma.
+
+To check processing and exports without a graphical session:
+
+```sh
+./target/release/gpr_studio --selftest selftest_out
+```
+
+The Linux CI also checks graphical startup and screenshot capture under Xvfb with Mesa
+software rendering. To run that check locally on Debian/Ubuntu:
+
+```sh
+sudo apt-get install xvfb xauth libgl1-mesa-dri
+env -u WAYLAND_DISPLAY LIBGL_ALWAYS_SOFTWARE=1 timeout 90s \
+  xvfb-run -a -s "-screen 0 1600x1000x24" \
+  ./target/release/gpr_studio --screenshot shots/linux-x11.png
+test -s shots/linux-x11.png
+```
 
 ## Command line
 
