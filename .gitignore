@@ -1,0 +1,14 @@
+# Build output
+/target/
+
+# Local test pictures, self-test output and one-off edit scripts
+/shots/
+/tools/
+/selftest_out/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

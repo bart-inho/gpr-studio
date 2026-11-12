@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "values": [
+    {"name": "default output CRS", "group": "map", "value": "EPSG:2056", "source": "person's request"},
+    {"name": "ask for GPS file after import (default)", "group": "import", "value": "yes", "source": "person's request"},
+    {"name": "SEG-Y sample interval unit", "group": "import", "value": "picoseconds", "source": "Reflexw string ev_013456102f (segy-timeincrement assumed in picosec)"},
+    {"name": "DZT data offset", "group": "import", "value": "rh_data*1024 when rh_data<1024", "source": "GSSI header layout, verified on DEMODATA/ASCII/*.dzt"},
+    {"name": "DZT 16-bit zero", "group": "import", "value": 32768, "source": "GSSI unsigned samples, verified on gprline_.dzt"},
+    {"name": "MALA sample interval", "group": "import", "value": "1000/FREQUENCY ns", "source": "DEMODATA dat_0001.rad: 544 samples x 0.3821 ns = TIMEWINDOW 207.88 ns"},
+    {"name": "REFLEXW samples offset", "group": "import", "value": "0x1a4", "source": "DEMODATA/PROCDATA headers"},
+    {"name": "REFLEXW traces offset", "group": "import", "value": "0x1c4", "source": "DEMODATA/PROCDATA headers"},
+    {"name": "REFLEXW trace header", "group": "import", "value": 156, "unit": "bytes", "source": "DEMODATA/PROCDATA file sizes"},
+    {"name": "default velocity", "group": "processing", "value": 0.1, "unit": "m/ns", "source": "manual 1.11.2.3 (v = 0.1 m/nsec)"},
+    {"name": "gain function exponent divisor", "group": "processing", "value": 8.69, "unit": "dB/neper", "source": "manual 1.11.2.3"},
+    {"name": "time-zero threshold", "group": "processing", "value": 20, "unit": "%", "estimated": true},
+    {"name": "energy decay median window", "group": "processing", "value": 11, "unit": "samples", "estimated": true},
+    {"name": "Butterworth zero phase", "group": "processing", "value": true, "estimated": true},
+    {"name": "Kirchhoff parameters", "group": "processing", "value": "summation width, velocity, start time, end time", "source": "function 0x00902e94"},
+    {"name": "Kirchhoff default summation width", "group": "processing", "value": 40, "unit": "traces", "estimated": true},
+    {"name": "Stolt time window factor", "group": "processing", "value": 2.0, "source": "manual 1.11.9.3 (example factor 2)"},
+    {"name": "depth from time", "group": "processing", "value": "z = v t / 2", "source": "manual 1.11.9.8"},
+    {"name": "permittivity from velocity", "group": "picking", "value": "eps = (0.2998/v)^2", "source": "physics"},
+    {"name": "snap window", "group": "picking", "value": 6, "unit": "samples", "estimated": true},
+    {"name": "basemap overview max side", "group": "map", "value": 4096, "unit": "px", "source": "design choice"},
+    {"name": "basemap detail max side", "group": "map", "value": 2048, "unit": "px", "source": "design choice"},
+    {"name": "GeoPackage version", "group": "export", "value": "1.2 (user_version 10200)", "source": "OGC GeoPackage spec"}
+  ]
+}
