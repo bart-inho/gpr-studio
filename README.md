@@ -36,14 +36,17 @@ The program is `target/release/gpr_studio` (`gpr_studio.exe` on Windows).
 Both **Wayland and X11** are enabled in the standard build. The application uses OpenGL;
 run it from a graphical desktop session with a working graphics driver (Mesa is supported).
 
-Install the native build dependencies first. For Debian/Ubuntu:
+Install the native build and runtime dependencies first. For Debian/Ubuntu:
 
 ```sh
 sudo apt-get update
-sudo apt-get install build-essential pkg-config libwayland-dev libxkbcommon-dev libgl1-mesa-dev libegl1-mesa-dev
+sudo apt-get install build-essential pkg-config libwayland-dev libxkbcommon-dev \
+  libxkbcommon-x11-0 libgl1-mesa-dev libegl1-mesa-dev
 cargo build --locked --release
 ./target/release/gpr_studio
 ```
+
+`libxkbcommon-x11-0` is required at runtime by the X11 backend, including under Xvfb.
 
 File and folder dialogs use **XDG Desktop Portal**. Make sure `xdg-desktop-portal` and
 the backend for your desktop are installed and running in your user session, for example
