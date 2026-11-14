@@ -6,7 +6,7 @@ picking, mapping and reporting. Written in Rust with egui; runs on Windows, macO
 ## Features
 
 - **Import** – GSSI `.dzt`, MALA `.rd3`/`.rd7` (+ `.rad`), ImpulseRadar `.iprb` (+ `.iprh`),
-  Sensors & Software `.dt1` (+ `.hd`), SEG-Y (IDS, Proceq and others) and REFLEXW `.??t`/`.??r`.
+  Sensors & Software `.dt1` (+ `.hd`) and SEG-Y (IDS, Proceq and others).
 - **GPS** – one dialog for all imported profiles; GPS files (`.cor`, `.dzg`, `.gps`, NMEA, CSV/TXT,
   SEG-Y trace headers) are matched automatically by file name, including channel endings such as `_0`/`_1`.
 - **Map** – GPS tracks of every profile, the part shown in the data view highlighted, markers and layer picks,
