@@ -161,6 +161,15 @@ pub struct App {
     pub segy_all: bool,
     pub confirm_close: bool,
     pub allow_close: bool,
+    pub topo_cache: Option<(String, crate::model::Section)>,
+    /// Per profile: was topography shown last frame (to refit the time axis when it changes).
+    pub topo_shown: HashMap<u32, bool>,
+    /// Show topography (one setting for every profile).
+    pub show_topo: bool,
+    /// The project as last saved or opened (None = never saved).
+    pub saved_snapshot: Option<String>,
+    /// Remember opened/saved projects as "last project" (off in the self-test).
+    pub remember_projects: bool,
 }
 
 impl App {
@@ -232,9 +241,28 @@ impl App {
             segy_all: false,
             confirm_close: false,
             allow_close: false,
+            topo_cache: None,
+            topo_shown: HashMap::new(),
+            show_topo: false,
+            saved_snapshot: None,
+            remember_projects: true,
         };
         if app.screenshot.is_some() {
             app.load_demo(true);
+            // Test switch for pictures of the topography display.
+            if std::env::var("GPRSTUDIO_SHOT_TOPO").is_ok() {
+                app.show_topo = true;
+            }
+            // Test switch: a view zoomed out to three times the profile length.
+            if std::env::var("GPRSTUDIO_SHOT_WIDE").is_ok() {
+                if let Some(p) = app.active_profile() {
+                    let (id, n) = (p.id, p.proc.ntr as f32);
+                    if let Some(v) = app.views.get_mut(&id) {
+                        v.tr0 = 0.0;
+                        v.tr1 = n * 3.0;
+                    }
+                }
+            }
         }
         let (tifs, data): (Vec<PathBuf>, Vec<PathBuf>) = files.into_iter().partition(|f| f.extension().map(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff")).unwrap_or(false));
         for t in tifs {
@@ -568,10 +596,13 @@ impl App {
                         ui.add(egui::DragValue::new(order).range(1..=12));
                         ui.end_row();
                     }
-                    Step::AgcGain { window_ns, scale, max_gain } => {
+                    Step::AgcGain { window_ns, scale, max_gain, smooth_traces } => {
                         dv(ui, "Window length", window_ns, 0.5, " ns");
                         dv(ui, "Scaling factor", scale, 0.05, "");
                         dv(ui, "Max. gain", max_gain, 5.0, "");
+                        ui.label("Smooth gain over (traces)").on_hover_text("Moving average of the gain curves of neighbouring traces: 1 = every trace its own gain; larger values give neighbouring traces a similar gain (no vertical stripes).");
+                        ui.add(egui::DragValue::new(smooth_traces).range(1..=1024));
+                        ui.end_row();
                     }
                     Step::EnergyDecay { scale } => dv(ui, "Scaling factor", scale, 0.05, ""),
                     Step::GainFunction { linear, exponent_db_m, t_start, max_gain } => {
@@ -592,10 +623,22 @@ impl App {
                         ui.label("Every trace is scaled to a maximum of 1.");
                         ui.end_row();
                     }
-                    Step::RunningAverage { traces } => {
-                        ui.label("Traces");
-                        ui.add(egui::DragValue::new(traces).range(1..=999));
+                    Step::RunningAverage { traces, t_start, t_end } => {
+                        ui.label("Average traces").on_hover_text("Each sample becomes the mean of itself and traces/2 traces on each side (4 = 5 traces). Smooths trace-to-trace differences, e.g. of the gain.");
+                        ui.add(egui::DragValue::new(traces).range(1..=1024));
                         ui.end_row();
+                        dv(ui, "Start time", t_start, 0.5, "");
+                        dv(ui, "End time", t_end, 0.5, "");
+                    }
+                    Step::AverageXY { traces, samples, t_start, t_end } => {
+                        ui.label("Nr. of traces (x)");
+                        ui.add(egui::DragValue::new(traces).range(1..=256));
+                        ui.end_row();
+                        ui.label("Nr. of samples (y)");
+                        ui.add(egui::DragValue::new(samples).range(0..=512));
+                        ui.end_row();
+                        dv(ui, "Start time", t_start, 0.5, "");
+                        dv(ui, "End time", t_end, 0.5, "");
                     }
                     Step::DiffractionStack { velocity, width } => {
                         dv(ui, "Velocity", velocity, 0.001, " m/ns");
@@ -1166,17 +1209,23 @@ impl App {
                             self.open_project(f);
                         }
                     }
-                    if ui.button("Save project…").clicked() {
-                        ui.close_menu();
-                        if let Some(f) = rfd::FileDialog::new().add_filter("GPR project", &["gprproj"]).set_file_name("survey.gprproj").save_file() {
-                            match crate::project::save(self, &f) {
-                                Ok(()) => {
-                                    self.status = format!("Project saved: {}", f.display());
-                                    self.project_path = Some(f);
-                                }
-                                Err(e) => self.status = format!("Project could not be saved: {e}"),
-                            }
+                    if let Some(last) = crate::settings::last_project() {
+                        let name = last.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                        let ok = last.exists();
+                        let r = ui.add_enabled(ok, egui::Button::new(format!("Open last project: {name}"))).on_hover_text(last.display().to_string());
+                        let r = if ok { r } else { r.on_disabled_hover_text(format!("{} no longer exists", last.display())) };
+                        if r.clicked() {
+                            ui.close_menu();
+                            self.open_project(last);
                         }
+                    }
+                    if ui.add(egui::Button::new("Save project").shortcut_text("Ctrl+S")).clicked() {
+                        ui.close_menu();
+                        self.save_project(false);
+                    }
+                    if ui.button("Save project as…").clicked() {
+                        ui.close_menu();
+                        self.save_project(true);
                     }
                     ui.separator();
                     if ui.button("File header…").clicked() {
@@ -1193,7 +1242,7 @@ impl App {
                     }
                 });
                 ui.menu_button("Processing", |ui| {
-                    let groups: [(&str, &[usize]); 5] = [("Static", &[0]), ("1D filter", &[1, 2, 4, 5]), ("Gain", &[6, 7, 8, 9, 10]), ("2D filter", &[3, 11]), ("Migration / depth", &[12, 13, 14, 15])];
+                    let groups: [(&str, &[usize]); 5] = [("Static", &[0]), ("1D filter", &[1, 2, 4, 5]), ("Gain", &[6, 7, 8, 9, 10]), ("2D filter", &[3, 11, 16]), ("Migration / depth", &[12, 13, 14, 15])];
                     let all = Step::defaults();
                     for (g, idx) in groups {
                         ui.label(RichText::new(g).weak());
@@ -1327,7 +1376,7 @@ impl App {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (m, icon, tip) in [
-                    (PickMode::Navigate, "✋ Navigate", "Drag to pan, wheel to zoom (Ctrl+wheel: time axis), double-click to fit"),
+                    (PickMode::Navigate, "✋ Navigate", "Drag to pan; wheel or side wheel: slide along the profile; Shift + wheel: time axis from 0 down to the depth you want; Ctrl + wheel: zoom horizontally (zooming out past the profile makes the plot narrower, never stretched); double-click to fit; Ctrl+S saves the project"),
                     (PickMode::Point, "+ Point", "Click to place a point marker.\nRight-click a pick to delete it; Shift + right-drag deletes all picks in a box.\nOnly picks of the type selected in the toolbar are deleted."),
                     (PickMode::Hyperbola, "^ Hyperbola", "Click the apex, drag a flank to fit the velocity, Enter saves.\nRight-click a hyperbola to delete it."),
                     (PickMode::Layer, "~ Layer", "Click along a reflector; double-click (or Enter) ends the line and the next click starts a new one.\nBackspace removes the last point; right-click deletes a pick; Shift + right-drag deletes picks in a box."),
@@ -1450,18 +1499,33 @@ impl App {
                     if ui.checkbox(&mut p.use_gps_distance, "Distance from GPS").on_hover_text("Otherwise traces are spaced by the nominal trace spacing").changed() {
                         p.update_distance();
                     }
-                    let r = ui.add(egui::DragValue::new(&mut p.dx).speed(0.001).range(0.001..=100.0).prefix("dx=").suffix(" m"));
+                    let r = ui
+                        .add(egui::DragValue::new(&mut p.dx).speed(0.0001).range(0.0001..=100.0).max_decimals(6).prefix("dx=").suffix(" m"))
+                        .on_hover_text(if p.dx_user_set { "Trace spacing typed in by hand" } else if p.dx_from_file { "Trace spacing from the data file header" } else { "No spacing in the file: default from the import options" });
                     if r.changed() {
+                        p.dx_user_set = true;
                         p.update_distance();
                     }
                 });
+                let can_topo = p.has_topo();
+                ui.horizontal(|ui| {
+                    let tip = if can_topo {
+                        format!("Time zero follows the GPS elevation: each trace moves down by 2·(highest − its elevation)/v, v = {:.3} m/ns (the v value in the toolbar). Display only.", p.velocity)
+                    } else {
+                        "Needs GPS positions with elevations that vary along the profile.".to_string()
+                    };
+                    ui.checkbox(&mut self.show_topo, "Show topography").on_hover_text(tip);
+                });
+                if self.show_topo && !can_topo {
+                    ui.weak("   (this profile has no varying GPS elevations)");
+                }
                 ui.weak(format!("{} · {} tr · {:.3} ns · {:.1} m", p.format, p.raw.ntr, p.raw.dt, p.length()));
             }
             ui.separator();
             ui.heading("Processing sequence");
             let all = Step::defaults();
             ui.horizontal_wrapped(|ui| {
-                for (i, short) in [(0, "Time 0"), (1, "Dewow"), (3, "Background"), (6, "AGC"), (8, "Gain f(t)"), (7, "Energy decay"), (4, "Bandpass"), (5, "Butterworth"), (13, "Kirchhoff"), (14, "FK Stolt"), (15, "Time-depth")] {
+                for (i, short) in [(0, "Time 0"), (1, "Dewow"), (3, "Background"), (6, "AGC"), (8, "Gain f(t)"), (7, "Energy decay"), (4, "Bandpass"), (5, "Butterworth"), (11, "Moving avg."), (16, "Avg xy"), (13, "Kirchhoff"), (14, "FK Stolt"), (15, "Time-depth")] {
                     if ui.small_button(short).on_hover_text(all[i].name()).clicked() {
                         self.open_step(all[i].clone());
                     }
@@ -1621,10 +1685,48 @@ impl App {
         });
     }
 
+    /// Save to the project's file (or ask for one: `ask` = "Save as"). True when saved.
+    pub fn save_project(&mut self, ask: bool) -> bool {
+        let path = match (&self.project_path, ask) {
+            (Some(p), false) => Some(p.clone()),
+            _ => {
+                let mut dlg = rfd::FileDialog::new().add_filter("GPR project", &["gprproj"]).set_title("Save project");
+                if let Some(p) = &self.project_path {
+                    if let Some(d) = p.parent() {
+                        dlg = dlg.set_directory(d);
+                    }
+                    if let Some(f) = p.file_name().and_then(|s| s.to_str()) {
+                        dlg = dlg.set_file_name(f);
+                    }
+                } else {
+                    dlg = dlg.set_file_name("survey.gprproj");
+                }
+                dlg.save_file()
+            }
+        };
+        let Some(f) = path else { return false };
+        match crate::project::save(self, &f) {
+            Ok(()) => {
+                self.status = format!("Project saved: {}", f.display());
+                self.saved_snapshot = Some(crate::project::snapshot(self));
+                if self.remember_projects {
+                    crate::settings::set_last_project(&f);
+                }
+                self.project_path = Some(f);
+                true
+            }
+            Err(e) => {
+                self.status = format!("Project could not be saved: {e}");
+                false
+            }
+        }
+    }
+
     /// Ask to save the project when the window is closed.
     fn close_question_ui(&mut self, ctx: &egui::Context) {
         let close_req = ctx.input(|i| i.viewport().close_requested());
-        if close_req && !self.allow_close && self.screenshot.is_none() && !self.profiles.is_empty() {
+        let unsaved = !self.profiles.is_empty() && self.saved_snapshot.as_deref() != Some(crate::project::snapshot(self).as_str());
+        if close_req && !self.allow_close && self.screenshot.is_none() && unsaved {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.confirm_close = true;
         }
@@ -1641,7 +1743,8 @@ impl App {
             ui.weak("The project keeps the file list, processing, GPS, picks, coordinate system and basemaps.");
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.add(egui::Button::new(RichText::new("  Save…  ").strong()).fill(Color32::from_rgb(200, 225, 255))).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let label = if self.project_path.is_some() { "  Save  " } else { "  Save…  " };
+                if ui.add(egui::Button::new(RichText::new(label).strong()).fill(Color32::from_rgb(200, 225, 255))).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     choice = 1;
                 }
                 if ui.button("Don't save").clicked() {
@@ -1654,27 +1757,10 @@ impl App {
         });
         match choice {
             1 => {
-                let mut dlg = rfd::FileDialog::new().add_filter("GPR project", &["gprproj"]).set_title("Save project");
-                if let Some(p) = &self.project_path {
-                    if let Some(d) = p.parent() {
-                        dlg = dlg.set_directory(d);
-                    }
-                    if let Some(f) = p.file_name().and_then(|s| s.to_str()) {
-                        dlg = dlg.set_file_name(f);
-                    }
-                } else {
-                    dlg = dlg.set_file_name("survey.gprproj");
-                }
-                if let Some(f) = dlg.save_file() {
-                    match crate::project::save(self, &f) {
-                        Ok(()) => {
-                            self.project_path = Some(f);
-                            self.allow_close = true;
-                            self.confirm_close = false;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        Err(e) => self.status = format!("Project could not be saved: {e}"),
-                    }
+                if self.save_project(false) {
+                    self.allow_close = true;
+                    self.confirm_close = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
             2 => {
@@ -1746,6 +1832,12 @@ fn spectrum_plot(ui: &mut egui::Ui, spec: &[(f32, f32)], step: &Step) {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.frame += 1;
+        for p in self.profiles.iter_mut() {
+            p.show_topo = self.show_topo;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) && !self.profiles.is_empty() {
+            self.save_project(false);
+        }
         self.poll_jobs(ctx);
         self.pump_tasks(ctx);
         self.menu_bar(ctx);

@@ -86,6 +86,12 @@ pub struct Profile {
     /// Per-trace distance along the profile (m).
     pub dist: Vec<f64>,
     pub use_gps_distance: bool,
+    /// The trace spacing was read from the data file's header.
+    pub dx_from_file: bool,
+    /// The trace spacing was typed in by the person (kept over the file's value).
+    pub dx_user_set: bool,
+    /// Show the section with topography (time zero follows the GPS elevation).
+    pub show_topo: bool,
     pub log: Vec<String>,
     pub version: u64,
 }
@@ -101,6 +107,9 @@ impl Profile {
             proc: raw.clone(),
             raw,
             dx: if dx > 0.0 && dx.is_finite() { dx } else { 0.05 },
+            dx_from_file: dx > 0.0 && dx.is_finite(),
+            dx_user_set: false,
+            show_topo: false,
             freq_mhz: 0.0,
             velocity: 0.1,
             steps: Vec::new(),
@@ -223,6 +232,35 @@ impl Profile {
         let a = self.coords[i];
         let b = self.coords[(i + 1).min(n - 1)];
         Some([a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f])
+    }
+
+    /// Elevations usable for a topographic display (GPS heights that vary).
+    pub fn has_topo(&self) -> bool {
+        if self.coords.len() != self.proc.ntr || self.coords.is_empty() {
+            return false;
+        }
+        let (mn, mx) = self.coords.iter().fold((f64::MAX, f64::MIN), |(a, b), c| (a.min(c[2]), b.max(c[2])));
+        mx > mn && mx.is_finite() && mn.is_finite()
+    }
+
+    /// Highest surface elevation and, per trace, the shift down in samples so that time zero
+    /// follows the topography: 2 (zmax - z) / v as time, or zmax - z for a depth section.
+    pub fn topo_shifts(&self) -> Option<(f64, Vec<f32>)> {
+        if !self.show_topo || !self.has_topo() {
+            return None;
+        }
+        let zmax = self.coords.iter().map(|c| c[2]).fold(f64::MIN, f64::max);
+        let v = self.velocity.max(1e-4) as f64;
+        let sh = self
+            .coords
+            .iter()
+            .map(|c| {
+                let dz = zmax - c[2];
+                let y = if self.proc.depth_axis { dz } else { 2.0 * dz / v };
+                (y / self.proc.dt as f64) as f32
+            })
+            .collect();
+        Some((zmax, sh))
     }
 
     /// Two-way time (ns, relative to time zero) to depth (m).

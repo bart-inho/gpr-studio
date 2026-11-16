@@ -40,6 +40,9 @@ Original coordinate conversions: UTM, UTM-degree, RD (NL), Swiss CH1903 only; he
 - **AGC gain** (§1.11.2.1): gain = mean |a| of whole trace / mean |a| in window, limited by max. gain, times scale.
 - **Energy decay** (§1.11.2.2): mean decay curve over all traces, median filtered (11 samples – *estimated*), data divided by it, times scale.
 - **Gain function** (§1.11.2.3): g(t) = (1 + a·t)·e^(b·t), a = a′/pulse width (pulse width = 1000/f ns), b = b′·v/8.69 with v = 0.1 m/ns, b′ in dB/m; g = 1 at start time; capped by max. gain.
+- **Running average / moving average** (§1.11.8.1): every sample = mean over the current trace and traces/2 traces on each side (4 → 5 traces), window shortened at the profile ends, max. 1024 traces, only between start and end time. Smooths trace-to-trace level (gain) differences.
+- **Average xy-filter** (§1.11.8.10): mean over traces/2 traces and samples/2 samples on each side of every point (max. 256 traces), start/end time.
+- **AGC option "smooth gain over N traces"** (added, not in REFLEXW): the AGC gain curves are averaged over N neighbouring traces before they are applied.
 - **Divergence compensation** (§1.11.2.5): × t (spherical) or × √t (line source).
 - **Diffraction stack** (§1.11.9.1): unweighted sum along t = √(t0² + (2x/v)²) over the summation width.
 - **Kirchhoff migration** (§1.11.9.2): time derivative first, then weighted sum (obliquity t0/t) along the hyperbola; parameters summation width, velocity, start/end time (FUN_00902e94).
@@ -70,6 +73,14 @@ profile, content, sample interval, CRS, header byte map and the processing steps
 scalar -100 (cm) at 71 (geographic CRS: arc seconds, scalar -1000, units 2 @89), elevation @41/45 scalar -100 at 69,
 distance along profile @197 with scalar -100 at 201. One file per profile and checked step: data processed up to and including
 that step. Verified with segyio and the app's own reader.
+
+## Data view controls and topography
+Wheel and side wheel slide along the profile; Shift + wheel crops the time/depth axis from 0 down (top fixed at 0); Ctrl + wheel (or Ctrl + Shift) zooms horizontally. Zoomed out past the profile, the plot narrows from the right at the same scale.
+Horizontal zoom-out goes up to 50 × the profile length (independent of the window width); a view wider than the profile starts
+at its first trace and the unused part is drawn in neutral dark grey (72, 72, 72).
+"Show topography" (one setting for all profiles, needs GPS elevations that vary): display only. Each trace is shifted down by
+2·(z_max − z)/v (time sections; v = the profile velocity in the toolbar, default 0.100 m/ns) or z_max − z (depth sections);
+the left axis is time below the highest point, the right axis elevation = z_max − v·t/2. Picks are stored unshifted.
 
 ## Exports
 GeoPackage 1.2 (application_id 0x47504B47, user_version 10200): `profiles` (LineStringZ), `trace_points`, `markers` (PointZ),

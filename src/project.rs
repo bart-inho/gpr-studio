@@ -18,6 +18,10 @@ struct ProjProfile {
     velocity: f32,
     freq_mhz: f32,
     use_gps_distance: bool,
+    #[serde(default)]
+    dx_user_set: bool,
+    #[serde(default)]
+    show_topo: bool,
     steps: Vec<StepEntry>,
     gps: Option<GpsTrack>,
 }
@@ -44,8 +48,18 @@ pub struct ProjFile {
 }
 
 pub fn save(app: &App, path: &Path) -> Result<(), String> {
-    let f = ProjFile {
-        version: 1,
+    let s = serde_json::to_string_pretty(&build(app)).map_err(|e| e.to_string())?;
+    std::fs::write(path, s).map_err(|e| e.to_string())
+}
+
+/// The project as it would be saved (compared with the last save to know about unsaved changes).
+pub fn snapshot(app: &App) -> String {
+    serde_json::to_string(&build(app)).unwrap_or_default()
+}
+
+fn build(app: &App) -> ProjFile {
+    ProjFile {
+        version: 2,
         crs: app.project_crs.clone(),
         profiles: app
             .profiles
@@ -59,6 +73,8 @@ pub fn save(app: &App, path: &Path) -> Result<(), String> {
                 velocity: p.velocity,
                 freq_mhz: p.freq_mhz,
                 use_gps_distance: p.use_gps_distance,
+                dx_user_set: p.dx_user_set,
+                show_topo: p.show_topo,
                 steps: p.steps.clone(),
                 gps: p.gps.clone(),
             })
@@ -69,9 +85,7 @@ pub fn save(app: &App, path: &Path) -> Result<(), String> {
         basemaps: app.basemaps.iter().map(|b| ProjBasemap { path: b.path.clone(), crs: b.crs.clone(), visible: b.visible, opacity: b.opacity }).collect(),
         next_pick_id: app.next_pick_id,
         import: app.import_opts.clone(),
-    };
-    let s = serde_json::to_string_pretty(&f).map_err(|e| e.to_string())?;
-    std::fs::write(path, s).map_err(|e| e.to_string())
+    }
 }
 
 pub fn parse(path: &Path) -> Result<ProjFile, String> {
@@ -114,10 +128,16 @@ pub fn load_profiles(mut file: ProjFile, path: PathBuf, prog: &std::sync::Arc<Pr
                     continue;
                 };
                 p.name = pp.name;
-                p.dx = pp.dx;
+                // The file's own distance interval wins unless the spacing was typed in by hand.
+                if pp.dx_user_set || !p.dx_from_file {
+                    p.dx = pp.dx;
+                    p.dx_user_set = pp.dx_user_set;
+                }
                 p.velocity = pp.velocity;
                 p.freq_mhz = pp.freq_mhz;
-                p.use_gps_distance = pp.use_gps_distance;
+                p.show_topo = pp.show_topo;
+                // Projects saved before version 2 always used GPS distance; now the file spacing comes first.
+                p.use_gps_distance = if file.version >= 2 { pp.use_gps_distance } else { !p.dx_from_file };
                 p.steps = pp.steps;
                 p.gps = pp.gps;
                 if p.steps.iter().any(|e| e.enabled) {
@@ -184,6 +204,14 @@ pub fn apply(app: &mut App, l: Loaded) -> String {
     app.reproject_all();
     app.active = if app.profiles.is_empty() { None } else { Some(0) };
     app.project_path = Some(l.path.clone());
+    app.show_topo = app.profiles.iter().any(|p| p.show_topo);
+    for p in app.profiles.iter_mut() {
+        p.show_topo = app.show_topo;
+    }
+    app.saved_snapshot = Some(snapshot(app));
+    if app.remember_projects {
+        crate::settings::set_last_project(&l.path);
+    }
     let name = l.path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
     if l.missing.is_empty() {
         format!("Project {name} opened: {} profiles.", app.profiles.len())

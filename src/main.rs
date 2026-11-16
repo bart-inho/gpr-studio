@@ -19,6 +19,7 @@ mod render;
 mod report;
 mod segy_export;
 mod selftest;
+mod settings;
 mod tasks;
 
 use std::path::PathBuf;

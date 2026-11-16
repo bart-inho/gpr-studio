@@ -73,6 +73,8 @@ fn grad(stops: &[(f32, [u8; 3])], u: f32) -> [u8; 3] {
     stops.last().unwrap().1
 }
 
+pub const NO_DATA: [u8; 3] = [72, 72, 72];
+
 /// Amplitude that maps to full colour: the 98th percentile of |amplitude| divided by contrast.
 pub fn clip_level(s: &Section, contrast: f32) -> f32 {
     let n = s.data.len();
@@ -99,7 +101,8 @@ pub fn render(s: &Section, tr0: f32, tr1: f32, s0: f32, s1: f32, w: usize, h: us
         return img;
     }
     let lut: Vec<[u8; 3]> = (0..512).map(|i| cmap.color(i as f32 / 255.5 - 1.0)).collect();
-    let bg = cmap.color(0.0);
+    // Outside the data (beyond the profile, above the topography): neutral dark grey.
+    let bg = NO_DATA;
     let inv = 1.0 / clip.max(1e-30);
     let col_tr: Vec<Option<usize>> = (0..w)
         .map(|x| {
@@ -140,8 +143,12 @@ pub fn render(s: &Section, tr0: f32, tr1: f32, s0: f32, s1: f32, w: usize, h: us
                     let a = tr[*i];
                     let b = if i + 1 < tr.len() { tr[i + 1] } else { a };
                     let v = (a + (b - a) * f) * inv;
-                    let k = ((v.clamp(-1.0, 1.0) + 1.0) * 255.5) as usize;
-                    lut[k.min(511)]
+                    if !v.is_finite() {
+                        bg
+                    } else {
+                        let k = ((v.clamp(-1.0, 1.0) + 1.0) * 255.5) as usize;
+                        lut[k.min(511)]
+                    }
                 }
             };
             img[o..o + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);

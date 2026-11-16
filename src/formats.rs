@@ -70,9 +70,11 @@ pub fn load(path: &Path, opt: &ImportOptions) -> Result<Vec<Profile>, String> {
         }
     };
     for p in out.iter_mut() {
-        if p.dx <= 0.0 || !p.dx.is_finite() {
+        if !p.dx_from_file {
             p.dx = opt.default_dx;
         }
+        // With a distance interval in the file, the x axis uses it; GPS distance stays an option.
+        p.use_gps_distance = !p.dx_from_file;
         p.update_distance();
     }
     Ok(out)
@@ -277,7 +279,8 @@ pub fn read_impulse(path: &Path) -> Result<Profile, String> {
     let h = read_kv(&hdr)?;
     let ns = kv_f(&h, &["SAMPLES"]).ok_or("SAMPLES missing in .iprh")? as usize;
     let fs = kv_f(&h, &["FREQUENCY"]).unwrap_or(1000.0);
-    let dx = kv_f(&h, &["USER DISTANCE INTERVAL", "DISTANCE INTERVAL"]).unwrap_or(0.0);
+    // DISTANCE INTERVAL is the calibrated wheel spacing; USER DISTANCE INTERVAL is only a fallback.
+    let dx = kv_f(&h, &["DISTANCE INTERVAL"]).filter(|v| *v > 0.0).or_else(|| kv_f(&h, &["USER DISTANCE INTERVAL"])).unwrap_or(0.0);
     let bits = kv_f(&h, &["DATA VERSION"]).unwrap_or(16.0) as usize;
     let bytes = if bits >= 32 { 4 } else { 2 };
     let data = std::fs::read(&data_path).map_err(|e| e.to_string())?;

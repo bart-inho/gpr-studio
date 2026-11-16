@@ -198,8 +198,18 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
         // ---------------------------------------------------------- radargram
         let gx = m + 34.0 * k;
         let gy = 30.0 * k + 26.0 * k;
-        let gw = pw - gx - m - 40.0 * k;
+        let gw_full = pw - gx - m - 40.0 * k;
         let gh = ph * 0.42;
+        // Horizontal scale. "One page every N m": N metres always fill the frame, so every page and
+        // every profile has the same scale and a shorter last part leaves the rest of the frame blank.
+        let ntr_page = (tr1 - tr0).max(1.0);
+        let d_first = p.dist_at(tr0);
+        let d_last = p.dist_at((tr1 - 1.0).max(tr0));
+        let dx_avg = if ntr_page > 1.0 { ((d_last - d_first) / (ntr_page as f64 - 1.0)).max(1e-9) } else { p.dx as f64 };
+        let page_len = ntr_page as f64 * dx_avg; // metres covered by the traces of this page
+        let span_m = if app.pdf_opts.range == PdfRange::Chunks { (app.pdf_opts.chunk_m as f64).max(page_len.min(app.pdf_opts.chunk_m as f64 * 1.05)) } else { page_len };
+        let scale = gw_full as f64 / span_m.max(1e-9); // points per metre
+        let gw = ((page_len * scale) as f32).clamp(4.0, gw_full);
         let res = 2.4f32;
         let (iw, ih) = (((gw * res) as usize).clamp(200, 4000), ((gh * res) as usize).clamp(100, 2400));
         let clip = crate::render::clip_level(&p.proc, 1.0) / app.contrast.max(0.01);
@@ -212,6 +222,18 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
         pg.stroke_color([0, 0, 0]);
         pg.line_width(0.8);
         pg.rect(gx, gy, gw, gh, false, true);
+        if gw < gw_full - 1.0 {
+            // Rest of the frame left blank: the profile ends here.
+            pg.stroke_color([170, 170, 170]);
+            pg.line_width(0.5);
+            pg.dash(3.0, 2.0);
+            pg.rect(gx, gy, gw_full, gh, false, true);
+            pg.dash(0.0, 0.0);
+            pg.fill_color([120, 120, 120]);
+            pg.text(gx + gw + 6.0, gy + 12.0, 7.5 * k, "end of profile", false);
+            pg.stroke_color([0, 0, 0]);
+            pg.line_width(0.8);
+        }
         let x_of = |tr: f32| gx + (tr + 0.5 - tr0) / (tr1 - tr0) * gw;
         let y_of = |s: f32| gy + (s + 0.5 - s0) / (s1 - s0) * gh;
         let depth_sec = p.proc.depth_axis;
@@ -236,23 +258,28 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
             let mut v = (da as f64 / step).ceil() * step;
             while v <= db as f64 + 1e-9 {
                 let y = y_of(p.proc.sample_of(p.time_of_depth(v as f32)));
-                pg.line([gx + gw, y], [gx + gw + 4.0, y]);
-                pg.text(gx + gw + 6.0, y + 2.5, fs, &fmt_tick(v, step), false);
+                pg.line([gx + gw_full, y], [gx + gw_full + 4.0, y]);
+                pg.text(gx + gw_full + 6.0, y + 2.5, fs, &fmt_tick(v, step), false);
                 v += step;
             }
             pg.text_rotated(pw - m - 2.0, gy + gh / 2.0 + 40.0, fs, &format!("depth [m] (v={:.3} m/ns)", p.velocity));
         }
-        let d0 = p.dist_at(tr0);
-        let d1 = p.dist_at((tr1 - 1.0).max(tr0));
-        let step = nice_step(d1 - d0, 10.0);
+        // Distance ticks at the page's fixed scale, across the whole frame (also over the blank part).
+        let d0 = d_first;
+        let d1 = d_first + span_m - dx_avg * 0.5;
+        let step = nice_step(span_m, 10.0);
+        let x_lin = |d: f64| gx + ((d - d_first + dx_avg * 0.5) * scale) as f32;
         let mut d = (d0 / step).ceil() * step;
         while d <= d1 + 1e-9 {
-            let x = x_of(p.trace_at_dist(d));
-            pg.line([x, gy + gh], [x, gy + gh + 4.0]);
-            pg.text_center(x, gy + gh + 12.0, fs, &fmt_tick(d, step), false);
+            let x = if d <= d_last { x_of(p.trace_at_dist(d)) } else { x_lin(d) };
+            if x <= gx + gw_full + 0.5 {
+                pg.line([x, gy + gh], [x, gy + gh + 4.0]);
+                pg.text_center(x, gy + gh + 12.0, fs, &fmt_tick(d, step), false);
+            }
             d += step;
         }
-        pg.text_center(gx + gw / 2.0, gy + gh + 22.0 * k, fs, "distance [m]", false);
+        let scale_note = if app.pdf_opts.range == PdfRange::Chunks { format!("distance [m]  ·  {:.0} m per page width", span_m) } else { "distance [m]".to_string() };
+        pg.text_center(gx + gw_full / 2.0, gy + gh + 22.0 * k, fs, &scale_note, false);
         // Picks on the radargram
         if app.pdf_opts.markers {
             pg.save();

@@ -45,12 +45,28 @@ pub enum Step {
     BackgroundRemoval { mode: BgMode, t_start: f32, t_end: f32 },
     BandpassFrequency { f1: f32, f2: f32, f3: f32, f4: f32, taper: Taper },
     BandpassButterworth { f_low: f32, f_high: f32, order: usize },
-    AgcGain { window_ns: f32, scale: f32, max_gain: f32 },
+    AgcGain {
+        window_ns: f32,
+        scale: f32,
+        max_gain: f32,
+        /// Gain curves averaged over this many neighbouring traces (1 = each trace its own gain).
+        #[serde(default = "one")]
+        smooth_traces: usize,
+    },
     EnergyDecay { scale: f32 },
     GainFunction { linear: f32, exponent_db_m: f32, t_start: f32, max_gain: f32 },
     Divergence { kind: Divergence },
     TraceNormalize,
-    RunningAverage { traces: usize },
+    /// Moving average over traces (REFLEXW "running average", manual 1.11.8.1).
+    RunningAverage {
+        traces: usize,
+        #[serde(default)]
+        t_start: f32,
+        #[serde(default = "far")]
+        t_end: f32,
+    },
+    /// Average over traces x samples around every point (REFLEXW "average xy-filter", 1.11.8.10).
+    AverageXY { traces: usize, samples: usize, t_start: f32, t_end: f32 },
     DiffractionStack { velocity: f32, width: usize },
     KirchhoffMigration { velocity: f32, width: usize, t_start: f32, t_end: f32 },
     FkMigration { velocity: f32, scale: f32 },
@@ -142,7 +158,8 @@ impl Step {
             Step::GainFunction { .. } => "Gain function",
             Step::Divergence { .. } => "Divergence compensation",
             Step::TraceNormalize => "Trace normalisation",
-            Step::RunningAverage { .. } => "Running average (x)",
+            Step::RunningAverage { .. } => "Running average (moving average)",
+            Step::AverageXY { .. } => "Average xy-filter",
             Step::DiffractionStack { .. } => "Diffraction stack",
             Step::KirchhoffMigration { .. } => "Kirchhoff migration",
             Step::FkMigration { .. } => "FK migration (Stolt)",
@@ -165,7 +182,13 @@ impl Step {
             },
             Step::BandpassFrequency { f1, f2, f3, f4, .. } => format!("{f1:.0}/{f2:.0}/{f3:.0}/{f4:.0} MHz"),
             Step::BandpassButterworth { f_low, f_high, order } => format!("{f_low:.0}-{f_high:.0} MHz, order {order}"),
-            Step::AgcGain { window_ns, .. } => format!("window {window_ns:.1} ns"),
+            Step::AgcGain { window_ns, smooth_traces, .. } => {
+                if *smooth_traces > 1 {
+                    format!("window {window_ns:.1} ns, gain smoothed over {smooth_traces} traces")
+                } else {
+                    format!("window {window_ns:.1} ns")
+                }
+            }
             Step::EnergyDecay { scale } => format!("scale {scale:.2}"),
             Step::GainFunction { linear, exponent_db_m, .. } => format!("a'={linear:.2}, b'={exponent_db_m:.2} dB/m"),
             Step::Divergence { kind } => match kind {
@@ -173,7 +196,8 @@ impl Step {
                 Divergence::Cylindrical => "line source (sqrt t)".into(),
             },
             Step::TraceNormalize => String::new(),
-            Step::RunningAverage { traces } => format!("{traces} traces"),
+            Step::RunningAverage { traces, t_start, t_end } => format!("{traces} traces, {}", trange(*t_start, *t_end)),
+            Step::AverageXY { traces, samples, t_start, t_end } => format!("{traces} traces x {samples} samples, {}", trange(*t_start, *t_end)),
             Step::DiffractionStack { velocity, width } => format!("v={velocity:.3} m/ns, {width} traces"),
             Step::KirchhoffMigration { velocity, width, t_start, t_end } => format!("v={velocity:.3} m/ns, {width} traces, {}", trange(*t_start, *t_end)),
             Step::FkMigration { velocity, scale } => format!("v={velocity:.3} m/ns, x{scale:.1}"),
@@ -189,21 +213,22 @@ impl Step {
             Step::BackgroundRemoval { mode: BgMode::WholeProfile, t_start: 0.0, t_end: 1e9 },
             Step::BandpassFrequency { f1: 100.0, f2: 200.0, f3: 600.0, f4: 900.0, taper: Taper::Cos },
             Step::BandpassButterworth { f_low: 150.0, f_high: 800.0, order: 4 },
-            Step::AgcGain { window_ns: 20.0, scale: 1.0, max_gain: 1000.0 },
+            Step::AgcGain { window_ns: 20.0, scale: 1.0, max_gain: 1000.0, smooth_traces: 1 },
             Step::EnergyDecay { scale: 1.0 },
             Step::GainFunction { linear: 1.0, exponent_db_m: 2.0, t_start: 0.0, max_gain: 1000.0 },
             Step::Divergence { kind: Divergence::Spherical },
             Step::TraceNormalize,
-            Step::RunningAverage { traces: 3 },
+            Step::RunningAverage { traces: 4, t_start: 0.0, t_end: 1e9 },
             Step::DiffractionStack { velocity: 0.1, width: 40 },
             Step::KirchhoffMigration { velocity: 0.1, width: 40, t_start: 0.0, t_end: 1e9 },
             Step::FkMigration { velocity: 0.1, scale: 2.0 },
             Step::TimeDepth { velocity: 0.1, max_depth: 0.0 },
+            Step::AverageXY { traces: 4, samples: 2, t_start: 0.0, t_end: 1e9 },
         ]
     }
 
     pub fn needs_time_axis(&self) -> bool {
-        !matches!(self, Step::TraceNormalize | Step::RunningAverage { .. })
+        !matches!(self, Step::TraceNormalize | Step::RunningAverage { .. } | Step::AverageXY { .. })
     }
 
     pub fn apply(&self, s: &Section, ctx: &Ctx) -> Result<Section, String> {
@@ -231,7 +256,7 @@ impl Step {
             Step::BackgroundRemoval { mode, t_start, t_end } => background_removal(&mut o, mode, t_start, t_end),
             Step::BandpassFrequency { f1, f2, f3, f4, taper } => bandpass_frequency(&mut o, [f1, f2, f3, f4], taper),
             Step::BandpassButterworth { f_low, f_high, order } => butterworth(&mut o, f_low, f_high, order.clamp(1, 12)),
-            Step::AgcGain { window_ns, scale, max_gain } => agc(&mut o, window_ns, scale, max_gain),
+            Step::AgcGain { window_ns, scale, max_gain, smooth_traces } => agc(&mut o, window_ns, scale, max_gain, smooth_traces),
             Step::EnergyDecay { scale } => energy_decay(&mut o, scale),
             Step::GainFunction { linear, exponent_db_m, t_start, max_gain } => {
                 gain_function(&mut o, linear, exponent_db_m, t_start, max_gain, ctx.freq_mhz)
@@ -257,21 +282,8 @@ impl Step {
                     }
                 }
             }
-            Step::RunningAverage { traces } => {
-                let h = (traces.max(1) / 2) as isize;
-                for t in 0..s.ntr as isize {
-                    let a = (t - h).max(0) as usize;
-                    let b = ((t + h) as usize).min(s.ntr - 1);
-                    let n = (b - a + 1) as f32;
-                    for i in 0..s.ns {
-                        let mut acc = 0.0;
-                        for k in a..=b {
-                            acc += s.data[k * s.ns + i];
-                        }
-                        o.data[t as usize * s.ns + i] = acc / n;
-                    }
-                }
-            }
+            Step::RunningAverage { traces, t_start, t_end } => average_xy(s, &mut o, traces, 0, t_start, t_end),
+            Step::AverageXY { traces, samples, t_start, t_end } => average_xy(s, &mut o, traces, samples, t_start, t_end),
             Step::DiffractionStack { velocity, width } => return Ok(kirchhoff(s, ctx, velocity, width, 0.0, 1e9, false)),
             Step::KirchhoffMigration { velocity, width, t_start, t_end } => {
                 return Ok(kirchhoff(s, ctx, velocity, width, t_start, t_end, true))
@@ -344,7 +356,7 @@ pub fn run_all(raw: &Section, steps: &[StepEntry], ctx: &Ctx) -> (Section, Vec<S
 
 fn sample_range(s: &Section, t1: f32, t2: f32) -> (usize, usize) {
     let a = s.sample_of(t1.min(t2)).floor().max(0.0) as usize;
-    let b = (s.sample_of(t1.max(t2)).ceil().max(0.0) as usize + 1).min(s.ns);
+    let b = ((s.sample_of(t1.max(t2)).ceil().clamp(0.0, s.ns as f32)) as usize).saturating_add(1).min(s.ns);
     (a.min(s.ns.saturating_sub(1)), b.max(a.min(s.ns.saturating_sub(1)) + 1).min(s.ns))
 }
 
@@ -622,11 +634,56 @@ fn butterworth(o: &mut Section, f_low: f32, f_high: f32, order: usize) {
     }
 }
 
-fn agc(o: &mut Section, window_ns: f32, scale: f32, max_gain: f32) {
+fn one() -> usize {
+    1
+}
+
+fn far() -> f32 {
+    1e9
+}
+
+/// Mean over +-traces/2 neighbouring traces and +-samples/2 samples around every point
+/// (the window shrinks at the edges), only between start and end time.
+/// samples = 0 is REFLEXW's running average; traces is limited to 1024 as there.
+fn average_xy(s: &Section, o: &mut Section, traces: usize, samples: usize, t_start: f32, t_end: f32) {
+    let (a, b) = sample_range(s, t_start, t_end);
+    let hx = (traces.clamp(1, 1024) / 2) as isize;
+    let hy = (samples / 2) as isize;
+    let ns = s.ns;
+    let ntr = s.ntr;
+    for i in a..b {
+        // Prefix sums over traces of the (vertically averaged) row.
+        let mut row = vec![0f64; ntr];
+        let i0 = (i as isize - hy).max(0) as usize;
+        let i1 = ((i as isize + hy) as usize).min(ns - 1);
+        let ny = (i1 - i0 + 1) as f64;
+        for t in 0..ntr {
+            let mut acc = 0f64;
+            for k in i0..=i1 {
+                acc += s.data[t * ns + k] as f64;
+            }
+            row[t] = acc / ny;
+        }
+        let mut pre = vec![0f64; ntr + 1];
+        for t in 0..ntr {
+            pre[t + 1] = pre[t] + row[t];
+        }
+        for t in 0..ntr as isize {
+            let lo = (t - hx).max(0) as usize;
+            let hi = ((t + hx) as usize).min(ntr - 1);
+            o.data[t as usize * ns + i] = ((pre[hi + 1] - pre[lo]) / (hi - lo + 1) as f64) as f32;
+        }
+    }
+}
+
+fn agc(o: &mut Section, window_ns: f32, scale: f32, max_gain: f32, smooth_traces: usize) {
     let w = ((window_ns / o.dt).round() as usize).max(1);
     let h = w / 2;
+    let ns = o.ns;
+    // Gain curve of every trace first ...
+    let mut gains = vec![0f32; o.ntr * ns];
     for t in 0..o.ntr {
-        let tr = o.trace_mut(t);
+        let tr = o.trace(t);
         let n = tr.len();
         let total = tr.iter().map(|v| v.abs() as f64).sum::<f64>() / n.max(1) as f64;
         let mut pre = vec![0f64; n + 1];
@@ -638,8 +695,19 @@ fn agc(o: &mut Section, window_ns: f32, scale: f32, max_gain: f32) {
             let b = (i + h + 1).min(n);
             let m = (pre[b] - pre[a]) / (b - a) as f64;
             let g = if m > 0.0 { (total / m) as f32 } else { max_gain };
-            tr[i] *= g.min(max_gain) * scale;
+            gains[t * ns + i] = g.min(max_gain);
         }
+    }
+    // ... then, optionally, a moving average of the gain curves over neighbouring traces,
+    // so neighbouring traces get a similar gain and no vertical stripes appear.
+    if smooth_traces > 1 {
+        let g = Section { ns, ntr: o.ntr, dt: o.dt, t0: o.t0, depth_axis: o.depth_axis, data: gains.clone() };
+        let mut out = g.clone();
+        average_xy(&g, &mut out, smooth_traces, 0, f32::MIN, f32::MAX);
+        gains = out.data;
+    }
+    for (v, g) in o.data.iter_mut().zip(gains.iter()) {
+        *v *= g * scale;
     }
 }
 

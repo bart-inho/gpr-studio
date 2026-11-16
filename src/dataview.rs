@@ -50,8 +50,34 @@ impl App {
             return;
         };
         let pid = self.profiles[a].id;
-        let (ntr, ns) = (self.profiles[a].proc.ntr as f32, self.profiles[a].proc.ns as f32);
+        // Topography: per-trace shift (display samples) and the shifted section to draw.
+        let topo = self.profiles[a].topo_shifts();
+        let sh: Vec<f32> = topo.as_ref().map(|t| t.1.clone()).unwrap_or_default();
+        let zmax = topo.as_ref().map(|t| t.0);
+        let max_shift = sh.iter().fold(0f32, |m, v| m.max(*v)).ceil() as usize;
+        if topo.is_some() {
+            let p = &self.profiles[a];
+            let key = format!("{}-{}-{:.5}-{}", p.id, p.version, p.velocity, p.coords.len());
+            if self.topo_cache.as_ref().map(|c| c.0 != key).unwrap_or(true) {
+                let s = &p.proc;
+                let mut d = crate::model::Section { ns: s.ns + max_shift, ntr: s.ntr, dt: s.dt, t0: s.t0, depth_axis: s.depth_axis, data: vec![f32::NAN; (s.ns + max_shift) * s.ntr] };
+                for t in 0..s.ntr {
+                    let k = sh[t].round().max(0.0) as usize;
+                    let ns2 = d.ns;
+                    d.data[t * ns2 + k..t * ns2 + k + s.ns].copy_from_slice(s.trace(t));
+                }
+                self.topo_cache = Some((key, d));
+            }
+        }
+        let shift = |tr: f32| -> f32 { if sh.is_empty() { 0.0 } else { sh[(tr.round().max(0.0) as usize).min(sh.len() - 1)] } };
+        let (ntr, ns) = (self.profiles[a].proc.ntr as f32, (self.profiles[a].proc.ns + if topo.is_some() { max_shift } else { 0 }) as f32);
         let mut view = self.views.get(&pid).cloned().unwrap_or(ViewState { tr0: 0.0, tr1: ntr, s0: 0.0, s1: ns });
+        // Topography switched on or off: the section height changed, show it all.
+        let topo_now = topo.is_some();
+        if self.topo_shown.insert(pid, topo_now).map(|was| was != topo_now).unwrap_or(topo_now) {
+            view.s0 = 0.0;
+            view.s1 = ns;
+        }
 
         // Header line
         {
@@ -79,7 +105,7 @@ impl App {
         let ascan_w = 110.0;
         let left = 58.0;
         let right = 58.0;
-        let top = 30.0;
+        let top = 38.0;
         let bottom = 36.0;
         let plot = Rect::from_min_max(avail.min + egui::vec2(left, top), avail.max - egui::vec2(right + ascan_w + 8.0, bottom));
         if plot.width() < 50.0 || plot.height() < 50.0 {
@@ -97,24 +123,24 @@ impl App {
             let cs = fr.sample_of_y(hp.y) + 0.5;
             let mut fx = 1.0f32;
             let mut fy = 1.0f32;
-            if zoom != 1.0 {
-                fx /= zoom;
-                fy /= zoom;
-            }
-            if scroll.y != 0.0 {
-                let f = (-scroll.y * 0.0025).exp();
-                if mods.ctrl || mods.command {
-                    fy *= f;
-                } else if mods.shift {
-                    let d = -scroll.y / plot.width() * (view.tr1 - view.tr0);
-                    view.tr0 += d;
-                    view.tr1 += d;
-                } else {
-                    fx *= f;
+            // Wheel: Shift = time axis from 0 down to x; Ctrl (or Ctrl+Shift) = horizontal zoom;
+            // plain wheel and side wheel = slide along the profile.
+            let ctrl = mods.ctrl || mods.command;
+            let wheel = scroll.x + scroll.y; // Shift turns the wheel into a horizontal scroll
+            if ctrl {
+                if zoom != 1.0 {
+                    fx /= zoom;
+                } else if wheel != 0.0 {
+                    fx *= (-wheel * 0.0025).exp();
                 }
-            }
-            if scroll.x != 0.0 {
-                let d = -scroll.x / plot.width() * (view.tr1 - view.tr0);
+            } else if mods.shift {
+                if wheel != 0.0 {
+                    // Crop from time zero: the top stays at 0, only the bottom moves.
+                    view.s0 = 0.0;
+                    view.s1 = (view.s1 * (-wheel * 0.0025).exp()).clamp(4.0, ns.max(4.0));
+                }
+            } else if wheel != 0.0 {
+                let d = -wheel / plot.width() * (view.tr1 - view.tr0);
                 view.tr0 += d;
                 view.tr1 += d;
             }
@@ -142,16 +168,33 @@ impl App {
             view = ViewState { tr0: 0.0, tr1: ntr, s0: 0.0, s1: ns };
         }
         // Clamp
-        let wtr = (view.tr1 - view.tr0).clamp(4.0, ntr.max(4.0) * 1.0);
+        // Horizontally the view may be wider than the profile (short profiles get small);
+        // the unused part stays grey and the profile starts at the left edge.
+        let wtr = (view.tr1 - view.tr0).clamp(4.0, ntr.max(4.0) * 50.0);
         let wtr = if wtr.is_finite() { wtr } else { ntr };
-        let c = ((view.tr0 + view.tr1) / 2.0).clamp(wtr / 2.0 - ntr * 0.02, ntr - wtr / 2.0 + ntr * 0.02);
-        view.tr0 = c - wtr / 2.0;
-        view.tr1 = c + wtr / 2.0;
+        if wtr > ntr {
+            view.tr0 = 0.0;
+            view.tr1 = wtr;
+        } else {
+            let c = ((view.tr0 + view.tr1) / 2.0).clamp(wtr / 2.0 - ntr * 0.02, ntr - wtr / 2.0 + ntr * 0.02);
+            view.tr0 = c - wtr / 2.0;
+            view.tr1 = c + wtr / 2.0;
+        }
         let ws = (view.s1 - view.s0).clamp(4.0, ns.max(4.0));
         let cs = ((view.s0 + view.s1) / 2.0).clamp(ws / 2.0, (ns - ws / 2.0).max(ws / 2.0));
         view.s0 = cs - ws / 2.0;
         view.s1 = cs + ws / 2.0;
         self.views.insert(pid, view.clone());
+        // Zoomed out beyond the profile: the plot gets narrower from the right at the same
+        // scale (no stretching), so a 2 m profile can be shown 2 m wide.
+        let full_plot = plot;
+        let (plot, view) = if view.tr1 - view.tr0 > ntr {
+            let w = (plot.width() * ntr / (view.tr1 - view.tr0)).max(8.0);
+            (Rect::from_min_size(plot.min, egui::vec2(w, plot.height())), ViewState { tr0: 0.0, tr1: ntr, s0: view.s0, s1: view.s1 })
+        } else {
+            (plot, view)
+        };
+        let _ = full_plot;
         let fr = Frame { plot, tr0: view.tr0, tr1: view.tr1, s0: view.s0, s1: view.s1 };
 
         // ---------------------------------------------------------- image
@@ -160,9 +203,10 @@ impl App {
         let clip = clip / self.contrast.max(0.01);
         let ppp = ui.ctx().pixels_per_point();
         let (w, h) = (((plot.width() * ppp) as usize).max(1), ((plot.height() * ppp) as usize).max(1));
-        let key = format!("{pid}-{}-{:.3}-{:.3}-{:.3}-{:.3}-{w}-{h}-{:?}-{:.4}", p.version, view.tr0, view.tr1, view.s0, view.s1, self.colormap, clip);
+        let key = format!("{pid}-{}-{:.3}-{:.3}-{:.3}-{:.3}-{w}-{h}-{:?}-{:.4}-{}", p.version, view.tr0, view.tr1, view.s0, view.s1, self.colormap, clip, self.topo_cache.as_ref().filter(|_| topo.is_some()).map(|c| c.0.as_str()).unwrap_or("flat"));
         if key != self.section_key || self.section_tex.is_none() {
-            let img = crate::render::render(&p.proc, view.tr0, view.tr1, view.s0, view.s1, w, h, self.colormap, clip);
+            let src_sec = if topo.is_some() { self.topo_cache.as_ref().map(|c| &c.1).unwrap_or(&p.proc) } else { &p.proc };
+            let img = crate::render::render(src_sec, view.tr0, view.tr1, view.s0, view.s1, w, h, self.colormap, clip);
             let ci = egui::ColorImage::from_rgba_unmultiplied([w, h], &img);
             match &mut self.section_tex {
                 Some(t) => t.set(ci, egui::TextureOptions::NEAREST),
@@ -171,7 +215,7 @@ impl App {
             self.section_key = key;
         }
         let painter = ui.painter_at(avail);
-        painter.rect_filled(plot.expand(1.0), 0.0, Color32::from_gray(90));
+        painter.rect_filled(plot.expand(1.0), 0.0, Color32::from_gray(72));
         if let Some(t) = &self.section_tex {
             painter.image(t.id(), plot, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
         }
@@ -213,14 +257,33 @@ impl App {
                 }
                 v += step;
             }
-            let label = if is_depth { format!("depth [m] (v={:.3})", p.velocity) } else { "time [ns]".to_string() };
+            let label = if is_depth { format!("depth [m] (v={:.3})", p.velocity) } else if zmax.is_some() { "time [ns] below the highest point".to_string() } else { "time [ns]".to_string() };
             let lx = if at_left { avail.left() + 2.0 } else { plot.right() + right - 12.0 };
             let galley = painter.layout_no_wrap(label, font.clone(), axis_col);
             let pos = Pos2::new(lx, plot.center().y + galley.size().x / 2.0);
             painter.add(egui::epaint::TextShape::new(pos, galley, axis_col).with_angle(-std::f32::consts::FRAC_PI_2));
         };
         draw_y_axis(primary_depth, true);
-        draw_y_axis(!primary_depth, false);
+        if let Some(zm) = zmax {
+            // Elevation axis: surface at the highest point minus the depth below it.
+            let (da, db) = (to_depth(y_top) as f64, to_depth(y_bot) as f64);
+            let (ea, eb) = (zm - db, zm - da);
+            let step = nice_step(eb - ea, (plot.height() / 45.0) as f64);
+            let mut e = (ea / step).ceil() * step;
+            while e <= eb + 1e-9 {
+                let y = y_px_of_val((zm - e) as f32, true);
+                if y >= plot.top() - 0.5 && y <= plot.bottom() + 0.5 {
+                    painter.line_segment([Pos2::new(plot.right(), y), Pos2::new(plot.right() + 5.0, y)], Stroke::new(1.0, axis_col));
+                    painter.text(Pos2::new(plot.right() + 7.0, y), Align2::LEFT_CENTER, fmt_tick(e, step), font.clone(), axis_col);
+                }
+                e += step;
+            }
+            let galley = painter.layout_no_wrap(format!("elevation [m] (v={:.3})", p.velocity), font.clone(), axis_col);
+            let pos = Pos2::new(plot.right() + right - 12.0, plot.center().y + galley.size().x / 2.0);
+            painter.add(egui::epaint::TextShape::new(pos, galley, axis_col).with_angle(-std::f32::consts::FRAC_PI_2));
+        } else {
+            draw_y_axis(!primary_depth, false);
+        }
         // Distance axis (bottom)
         let d0 = p.dist_at(view.tr0.max(0.0));
         let d1 = p.dist_at(view.tr1.min(ntr - 1.0));
@@ -234,27 +297,27 @@ impl App {
             d += step;
         }
         painter.text(Pos2::new(plot.center().x, plot.bottom() + 22.0), Align2::CENTER_TOP, if p.use_gps_distance && p.has_coords() { "distance [m] (GPS)" } else { "distance [m]" }, font.clone(), axis_col);
-        // Trace numbers (top)
-        let tstep = nice_step((view.tr1 - view.tr0) as f64, (plot.width() / 80.0) as f64).max(1.0);
-        let mut t = ((view.tr0 as f64 + 1.0) / tstep).ceil() * tstep;
-        while t <= view.tr1 as f64 + 1.0 {
-            let x = fr.x_of_trace(t as f32 - 1.0);
-            if x >= plot.left() && x <= plot.right() {
+        // Distance in metres on top as well (trace numbers are in the status bar).
+        let mut d = (d0 / step).ceil() * step;
+        while d <= d1 + 1e-9 {
+            let x = fr.x_of_trace(p.trace_at_dist(d));
+            if x >= plot.left() - 0.5 && x <= plot.right() + 0.5 {
                 painter.line_segment([Pos2::new(x, plot.top()), Pos2::new(x, plot.top() - 4.0)], Stroke::new(1.0, axis_col));
-                painter.text(Pos2::new(x, plot.top() - 5.0), Align2::CENTER_BOTTOM, format!("{t:.0}"), font.clone(), axis_col);
+                painter.text(Pos2::new(x, plot.top() - 5.0), Align2::CENTER_BOTTOM, fmt_tick(d, step), font.clone(), axis_col);
             }
-            t += tstep;
+            d += step;
         }
-        painter.text(Pos2::new(plot.left(), avail.top() + 2.0), Align2::LEFT_TOP, "trace", font.clone(), Color32::GRAY);
+        let src = if p.use_gps_distance && p.has_coords() { "from GPS".to_string() } else { format!("trace spacing {} m", format!("{:.6}", p.dx).trim_end_matches('0').trim_end_matches('.')) };
+        painter.text(Pos2::new(plot.left(), avail.top() + 2.0), Align2::LEFT_TOP, format!("distance [m] · {src}"), font.clone(), Color32::GRAY);
 
         // ---------------------------------------------------------- picks overlay
         let marker_pos = |m: &Marker| -> Pos2 {
             let y = if depth_sec { p.depth_of_time(m.time_ns) } else { m.time_ns };
-            Pos2::new(fr.x_of_trace(m.trace), fr.y_of_sample(p.proc.sample_of(y)))
+            Pos2::new(fr.x_of_trace(m.trace), fr.y_of_sample(p.proc.sample_of(y) + shift(m.trace)))
         };
         let line_pt = |tr: f32, t: f32| -> Pos2 {
             let y = if depth_sec { p.depth_of_time(t) } else { t };
-            Pos2::new(fr.x_of_trace(tr), fr.y_of_sample(p.proc.sample_of(y)))
+            Pos2::new(fr.x_of_trace(tr), fr.y_of_sample(p.proc.sample_of(y) + shift(tr)))
         };
         let draw_line = |l: &LinePick, open: bool, sel: bool| {
             let Some(t) = self.marker_types.get(l.type_idx) else { return };
@@ -340,9 +403,10 @@ impl App {
         // ---------------------------------------------------------- hover + picking
         self.hover = None;
         let mut action: Option<Action> = None;
-        if let Some(hp) = hover_pos {
+        if let Some(hp) = hover_pos.filter(|h| plot.contains(*h)) {
             let tr = fr.trace_of_x(hp.x).clamp(0.0, ntr - 1.0);
-            let s = fr.sample_of_y(hp.y).clamp(0.0, ns - 1.0);
+            // Sample of the processed data under the pointer (the topography shift removed).
+            let s = (fr.sample_of_y(hp.y) - shift(tr)).clamp(0.0, (p.proc.ns as f32 - 1.0).max(0.0));
             self.hover = Some((tr, p.proc.y_of(s)));
             plot_painter.line_segment([Pos2::new(hp.x, plot.top()), Pos2::new(hp.x, plot.bottom())], Stroke::new(0.6, Color32::from_rgba_unmultiplied(255, 255, 0, 120)));
             plot_painter.line_segment([Pos2::new(plot.left(), hp.y), Pos2::new(plot.right(), hp.y)], Stroke::new(0.6, Color32::from_rgba_unmultiplied(255, 255, 0, 120)));
@@ -353,7 +417,7 @@ impl App {
             // Snap preview
             if matches!(self.mode, PickMode::Point | PickMode::Hyperbola | PickMode::Layer) && self.snap != Snap::None {
                 let ss = self.snap_at(p, tri, s);
-                plot_painter.circle_stroke(Pos2::new(fr.x_of_trace(tri as f32), fr.y_of_sample(ss)), 4.0, Stroke::new(1.5, Color32::from_rgb(0, 255, 255)));
+                plot_painter.circle_stroke(Pos2::new(fr.x_of_trace(tri as f32), fr.y_of_sample(ss + shift(tri as f32))), 4.0, Stroke::new(1.5, Color32::from_rgb(0, 255, 255)));
             }
             // `only`: restrict to one marker type (deleting never touches other types).
             let nearest_pick = |only: Option<usize>| -> Option<u32> {
@@ -524,7 +588,7 @@ impl App {
 
         // ---------------------------------------------------------- A-scan
         let p = &self.profiles[a];
-        let arect = Rect::from_min_max(Pos2::new(plot.right() + right + 4.0, plot.top()), Pos2::new(plot.right() + right + 4.0 + ascan_w, plot.bottom()));
+        let arect = Rect::from_min_max(Pos2::new(avail.right() - ascan_w, plot.top()), Pos2::new(avail.right(), plot.bottom()));
         let ap = ui.painter_at(arect.expand(2.0));
         ap.rect_filled(arect, 0.0, Color32::from_gray(248));
         ap.rect_stroke(arect, 0.0, Stroke::new(1.0, Color32::from_gray(160)), egui::StrokeKind::Inside);
@@ -534,7 +598,10 @@ impl App {
             let col = p.proc.trace(tr_show);
             let sa = view.s0.max(0.0) as usize;
             let sb = (view.s1.ceil() as usize).min(p.proc.ns);
-            let pts: Vec<Pos2> = (sa..sb).map(|s| Pos2::new(arect.center().x + (col[s] / (clip * 1.5)).clamp(-1.0, 1.0) * ascan_w * 0.48, fr.y_of_sample(s as f32))).collect();
+            let off = shift(tr_show as f32);
+            let sa = (view.s0 - off).max(0.0) as usize;
+            let sb = ((view.s1 - off).ceil().max(0.0) as usize).min(p.proc.ns);
+            let pts: Vec<Pos2> = (sa..sb).map(|s| Pos2::new(arect.center().x + (col[s] / (clip * 1.5)).clamp(-1.0, 1.0) * ascan_w * 0.48, fr.y_of_sample(s as f32 + off))).collect();
             ap.add(egui::Shape::line(pts, Stroke::new(1.0, Color32::from_rgb(20, 60, 160))));
         }
         ap.text(arect.left_top() + egui::vec2(3.0, 2.0), Align2::LEFT_TOP, format!("trace {}", tr_show + 1), FontId::proportional(10.5), Color32::DARK_GRAY);

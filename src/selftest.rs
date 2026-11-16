@@ -145,6 +145,7 @@ pub fn run(out: PathBuf, files: Vec<PathBuf>) -> i32 {
         let proj = out.join("selftest.gprproj");
         crate::project::save(&a3, &proj).ok();
         let mut a4 = App::headless(vec![], None);
+        a4.remember_projects = false;
         a4.open_project(proj);
         let t0 = std::time::Instant::now();
         let mut last = String::new();
@@ -227,6 +228,24 @@ pub fn run(out: PathBuf, files: Vec<PathBuf>) -> i32 {
                 }
             }
         }
+    }
+
+    // AGC gain smoothing over traces: neighbouring traces get more similar levels
+    {
+        let mut src = p.proc.clone();
+        // Uneven trace levels, as from a varying coupling.
+        for t in 0..src.ntr {
+            let f = 1.0 + 0.6 * ((t as f32) * 1.7).sin();
+            src.trace_mut(t).iter_mut().for_each(|v| *v *= f);
+        }
+        let jump = |s: &crate::model::Section| {
+            let rms: Vec<f64> = (0..s.ntr).map(|t| (s.trace(t).iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / s.ns as f64).sqrt()).collect();
+            rms.windows(2).map(|w| (w[1] - w[0]).abs() / w[0].max(1e-9)).sum::<f64>() / (rms.len() - 1) as f64
+        };
+        let a1 = Step::AgcGain { window_ns: 20.0, scale: 1.0, max_gain: 1000.0, smooth_traces: 1 }.apply(&src, &ctx).unwrap();
+        let a25 = Step::AgcGain { window_ns: 20.0, scale: 1.0, max_gain: 1000.0, smooth_traces: 25 }.apply(&src, &ctx).unwrap();
+        let ra = Step::RunningAverage { traces: 8, t_start: 0.0, t_end: 1e9 }.apply(&src, &ctx).unwrap();
+        println!("TRACE-TO-TRACE LEVEL JUMP: input {:.3}, AGC {:.3}, AGC smoothed over 25 traces {:.3}, running average 8 traces {:.3}", jump(&src), jump(&a1), jump(&a25), jump(&ra));
     }
 
     // Exports

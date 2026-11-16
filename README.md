@@ -12,13 +12,20 @@ picking, mapping and reporting. Written in Rust with egui; runs on Windows, macO
 - **Map** – GPS tracks of every profile, the part shown in the data view highlighted, markers and layer picks,
   GeoTIFF basemaps of any size, any output coordinate system (EPSG code or PROJ string; default EPSG:2056).
 - **Processing** – set time zero, dewow, DC shift, background removal, bandpass (FFT and Butterworth),
-  AGC, energy decay, gain function, divergence compensation, trace normalisation, running average,
+  AGC (optionally with the gain smoothed over neighbouring traces), energy decay, gain function,
+  divergence compensation, trace normalisation, running (moving) average over traces, average xy-filter,
   diffraction stack, Kirchhoff and FK (Stolt) migration, time-depth conversion. Runs in the background
   with a progress bar; sequences can be applied to all profiles.
+- **Data view** – distance in metres from the file's trace spacing (or GPS); "Show topography" lets time
+  zero follow the GPS elevation (velocity from the toolbar) with an elevation axis. Wheel / side wheel slide
+  along the profile, Shift + wheel crops the time axis from 0, Ctrl + wheel zooms horizontally (short profiles
+  are drawn narrower at the same scale, never stretched).
 - **Picking** – typed point markers, hyperbola velocity fitting, layer lines with phase following and snapping.
 - **Export** – GeoPackage (profiles, markers, layer picks, trace points), SEG-Y of chosen processing steps,
   PDF report (radargram + map with the same section highlighted), CSV of picks.
 - **Projects** – `.gprproj` files keep the file list, processing, GPS, picks, CRS and basemaps.
+  Ctrl+S saves to the project's file, File › Open last project reopens the previous one, and closing only
+  asks to save when something changed.
 
 ## Build
 
