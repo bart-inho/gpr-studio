@@ -2,6 +2,8 @@
 //! Formulas follow the original program's manual (see MECHANICS.md).
 
 use crate::model::Section;
+use crate::model::Profile;
+use crate::crs::CrsSpec;
 use rustfft::num_complex::Complex32;
 use rustfft::FftPlanner;
 use serde::{Deserialize, Serialize};
@@ -69,11 +71,12 @@ pub enum Step {
     AverageXY { traces: usize, samples: usize, t_start: f32, t_end: f32 },
     DiffractionStack { velocity: f32, width: usize },
     KirchhoffMigration { velocity: f32, width: usize, t_start: f32, t_end: f32 },
+    TopographicKirchhoff { velocity: f32, width: usize, t_start: f32, t_end: f32, gps_above_antenna_m: f32, max_gap_m: f32 },
     FkMigration { velocity: f32, scale: f32 },
     TimeDepth { velocity: f32, max_depth: f32 },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StepEntry {
     pub enabled: bool,
     pub step: Step,
@@ -87,6 +90,14 @@ pub struct Ctx {
     pub progress: Option<std::sync::Arc<Progress>>,
     /// Shown before the step name in the progress text.
     pub label: String,
+    /// Validated horizontal chainage and antenna elevations for topographic migration.
+    pub topography: Option<std::sync::Arc<TopographicGeometry>>,
+    pub topography_error: Option<String>,
+}
+
+pub struct TopographicGeometry {
+    pub x_m: Vec<f64>,
+    pub elevation_m: Vec<f64>,
 }
 
 impl Ctx {
@@ -97,6 +108,15 @@ impl Ctx {
     }
     pub fn cancelled(&self) -> bool {
         self.progress.as_ref().map(|p| p.is_cancelled()).unwrap_or(false)
+    }
+}
+
+pub fn topography_for_steps(p: &Profile, crs: &CrsSpec) -> (Option<std::sync::Arc<TopographicGeometry>>, Option<String>) {
+    let gap = p.steps.iter().find_map(|e| if e.enabled { if let Step::TopographicKirchhoff { max_gap_m, .. } = &e.step { Some(*max_gap_m) } else { None } } else { None });
+    match gap.map(|g| p.topographic_geometry(crs, g)) {
+        Some(Ok(geometry)) => (Some(std::sync::Arc::new(geometry)), None),
+        Some(Err(error)) => (None, Some(error)),
+        None => (None, None),
     }
 }
 
@@ -162,6 +182,7 @@ impl Step {
             Step::AverageXY { .. } => "Average xy-filter",
             Step::DiffractionStack { .. } => "Diffraction stack",
             Step::KirchhoffMigration { .. } => "Kirchhoff migration",
+            Step::TopographicKirchhoff { .. } => "Topographic Kirchhoff",
             Step::FkMigration { .. } => "FK migration (Stolt)",
             Step::TimeDepth { .. } => "Time-depth conversion",
         }
@@ -200,6 +221,7 @@ impl Step {
             Step::AverageXY { traces, samples, t_start, t_end } => format!("{traces} traces x {samples} samples, {}", trange(*t_start, *t_end)),
             Step::DiffractionStack { velocity, width } => format!("v={velocity:.3} m/ns, {width} traces"),
             Step::KirchhoffMigration { velocity, width, t_start, t_end } => format!("v={velocity:.3} m/ns, {width} traces, {}", trange(*t_start, *t_end)),
+            Step::TopographicKirchhoff { velocity, width, t_start, t_end, gps_above_antenna_m, max_gap_m } => format!("v={velocity:.3} m/ns, {width} traces, {}, GPS above antenna {gps_above_antenna_m:.2} m, max GPS gap {max_gap_m:.2} m", trange(*t_start, *t_end)),
             Step::FkMigration { velocity, scale } => format!("v={velocity:.3} m/ns, x{scale:.1}"),
             Step::TimeDepth { velocity, .. } => format!("v={velocity:.3} m/ns"),
         }
@@ -224,6 +246,7 @@ impl Step {
             Step::FkMigration { velocity: 0.1, scale: 2.0 },
             Step::TimeDepth { velocity: 0.1, max_depth: 0.0 },
             Step::AverageXY { traces: 4, samples: 2, t_start: 0.0, t_end: 1e9 },
+            Step::TopographicKirchhoff { velocity: 0.1, width: 40, t_start: 0.0, t_end: 1e9, gps_above_antenna_m: 0.0, max_gap_m: 2.0 },
         ]
     }
 
@@ -232,12 +255,25 @@ impl Step {
     }
 
     pub fn apply(&self, s: &Section, ctx: &Ctx) -> Result<Section, String> {
+        if s.depth_datum_m.is_some() {
+            return Err("topographic Kirchhoff output is a depth grid with blank cells; keep it as the last enabled processing step".into());
+        }
         if s.depth_axis && self.needs_time_axis() {
             return Err("the section is already converted to depth".into());
         }
-        let mut o = s.clone();
         match *self {
             Step::TimeZero { mode, shift_ns, threshold_pct } => return Ok(time_zero(s, mode, shift_ns, threshold_pct)),
+            Step::DiffractionStack { velocity, width } => return Ok(kirchhoff(s, ctx, velocity, width, 0.0, 1e9, false)),
+            Step::KirchhoffMigration { velocity, width, t_start, t_end } => return Ok(kirchhoff(s, ctx, velocity, width, t_start, t_end, true)),
+            Step::FkMigration { velocity, scale } => return Ok(stolt(s, ctx, velocity, scale)),
+            Step::TopographicKirchhoff { velocity, width, t_start, t_end, gps_above_antenna_m, .. } => {
+                let geometry = ctx.topography.as_ref().ok_or_else(|| ctx.topography_error.clone().unwrap_or_else(|| "Topographic Kirchhoff requires valid GPS antenna positions and elevations.".into()))?;
+                return topographic_kirchhoff(s, ctx, geometry, velocity, width, t_start, t_end, gps_above_antenna_m);
+            }
+            _ => {}
+        }
+        let mut o = s.clone();
+        match *self {
             Step::Dewow { window_ns } => {
                 let w = ((window_ns / s.dt).round() as usize).max(1);
                 for t in 0..s.ntr {
@@ -284,11 +320,7 @@ impl Step {
             }
             Step::RunningAverage { traces, t_start, t_end } => average_xy(s, &mut o, traces, 0, t_start, t_end),
             Step::AverageXY { traces, samples, t_start, t_end } => average_xy(s, &mut o, traces, samples, t_start, t_end),
-            Step::DiffractionStack { velocity, width } => return Ok(kirchhoff(s, ctx, velocity, width, 0.0, 1e9, false)),
-            Step::KirchhoffMigration { velocity, width, t_start, t_end } => {
-                return Ok(kirchhoff(s, ctx, velocity, width, t_start, t_end, true))
-            }
-            Step::FkMigration { velocity, scale } => return Ok(stolt(s, ctx, velocity, scale)),
+            Step::TimeZero { .. } | Step::DiffractionStack { .. } | Step::KirchhoffMigration { .. } | Step::TopographicKirchhoff { .. } | Step::FkMigration { .. } => unreachable!(),
             Step::TimeDepth { velocity, max_depth } => {
                 // Constant velocity: depth = v * t / 2 for every sample (t relative to time zero).
                 o.depth_axis = true;
@@ -317,7 +349,7 @@ fn trange(a: f32, b: f32) -> String {
 /// Rough relative cost of a step, used to share the progress bar between steps.
 fn step_cost(s: &Step) -> f32 {
     match s {
-        Step::KirchhoffMigration { .. } | Step::DiffractionStack { .. } => 40.0,
+        Step::KirchhoffMigration { .. } | Step::TopographicKirchhoff { .. } | Step::DiffractionStack { .. } => 40.0,
         Step::FkMigration { .. } => 15.0,
         Step::BandpassFrequency { .. } | Step::BandpassButterworth { .. } => 2.0,
         _ => 1.0,
@@ -362,7 +394,7 @@ fn sample_range(s: &Section, t1: f32, t2: f32) -> (usize, usize) {
 
 fn crop_samples(s: &Section, first: usize, count: usize) -> Section {
     let count = count.min(s.ns - first.min(s.ns));
-    let mut o = Section { ns: count, ntr: s.ntr, dt: s.dt, t0: s.y_of(first as f32), depth_axis: s.depth_axis, data: vec![0.0; count * s.ntr] };
+    let mut o = Section { ns: count, ntr: s.ntr, dt: s.dt, t0: s.y_of(first as f32), depth_axis: s.depth_axis, depth_datum_m: s.depth_datum_m, data: vec![0.0; count * s.ntr] };
     for t in 0..s.ntr {
         o.trace_mut(t).copy_from_slice(&s.trace(t)[first..first + count]);
     }
@@ -701,7 +733,7 @@ fn agc(o: &mut Section, window_ns: f32, scale: f32, max_gain: f32, smooth_traces
     // ... then, optionally, a moving average of the gain curves over neighbouring traces,
     // so neighbouring traces get a similar gain and no vertical stripes appear.
     if smooth_traces > 1 {
-        let g = Section { ns, ntr: o.ntr, dt: o.dt, t0: o.t0, depth_axis: o.depth_axis, data: gains.clone() };
+        let g = Section { ns, ntr: o.ntr, dt: o.dt, t0: o.t0, depth_axis: o.depth_axis, depth_datum_m: o.depth_datum_m, data: gains.clone() };
         let mut out = g.clone();
         average_xy(&g, &mut out, smooth_traces, 0, f32::MIN, f32::MAX);
         gains = out.data;
@@ -751,14 +783,16 @@ fn gain_function(o: &mut Section, linear: f32, exponent_db_m: f32, t_start: f32,
 /// Constant-velocity zero-offset time migration by summation along diffraction hyperbolas.
 /// `weighted` = Kirchhoff (time derivative, obliquity weight), otherwise plain diffraction stack.
 fn kirchhoff(s: &Section, ctx: &Ctx, v: f32, width: usize, t_start: f32, t_end: f32, weighted: bool) -> Section {
+    #[derive(Clone, Copy)]
+    struct Geometry { sample: usize, fraction: f32, weight: f32 }
     let dx = ctx.dx;
     let ns = s.ns;
     let ntr = s.ntr;
-    let mut input = s.clone();
-    if weighted {
+    let mut derivative = if weighted { Some(s.clone()) } else { None };
+    if let Some(input) = &mut derivative {
         for t in 0..ntr {
             let tr = input.trace_mut(t);
-            let orig = tr.to_vec();
+            let orig = s.trace(t);
             for i in 0..ns {
                 let a = if i > 0 { orig[i - 1] } else { orig[i] };
                 let b = if i + 1 < ns { orig[i + 1] } else { orig[i] };
@@ -766,10 +800,28 @@ fn kirchhoff(s: &Section, ctx: &Ctx, v: f32, width: usize, t_start: f32, t_end: 
             }
         }
     }
+    let input = derivative.as_ref().unwrap_or(s);
     let half = (width.max(1) / 2) as isize;
     let (a, b) = sample_range(s, t_start, t_end);
     let mut out = s.clone();
     let k = 2.0 * dx / v.max(1e-4); // two-way time per trace offset (ns)
+    // Travel time depends on sample and trace offset, not on the output trace.
+    let offsets = half as usize + 1;
+    let invalid = Geometry { sample: usize::MAX, fraction: 0.0, weight: 0.0 };
+    let mut geometry = vec![invalid; (b - a) * offsets];
+    for i in a..b {
+        let t0 = s.y_of(i as f32).max(0.0);
+        for di in 0..offsets {
+            let off = k * di as f32;
+            let t = (t0 * t0 + off * off).sqrt();
+            let si = s.sample_of(t);
+            if si < 0.0 || si >= (ns - 1) as f32 { continue; }
+            let j = si.floor() as usize;
+            let f = si - j as f32;
+            let w = if weighted { if t > 0.0 { t0 / t } else { 1.0 } } else { 1.0 };
+            geometry[(i - a) * offsets + di] = Geometry { sample: j, fraction: f, weight: w };
+        }
+    }
     for x0 in 0..ntr as isize {
         if x0 % 16 == 0 {
             ctx.tick(x0 as f32 / ntr as f32);
@@ -778,7 +830,6 @@ fn kirchhoff(s: &Section, ctx: &Ctx, v: f32, width: usize, t_start: f32, t_end: 
             }
         }
         for i in a..b {
-            let t0 = s.y_of(i as f32).max(0.0);
             let mut acc = 0f32;
             let mut wsum = 0f32;
             for dxi in -half..=half {
@@ -786,24 +837,180 @@ fn kirchhoff(s: &Section, ctx: &Ctx, v: f32, width: usize, t_start: f32, t_end: 
                 if x < 0 || x >= ntr as isize {
                     continue;
                 }
-                let off = k * dxi as f32;
-                let t = (t0 * t0 + off * off).sqrt();
-                let si = s.sample_of(t);
-                if si < 0.0 || si >= (ns - 1) as f32 {
-                    continue;
-                }
-                let j = si.floor() as usize;
-                let f = si - j as f32;
+                let g = geometry[(i - a) * offsets + dxi.unsigned_abs()];
+                if g.sample == usize::MAX { continue; }
                 let tr = input.trace(x as usize);
-                let val = tr[j] * (1.0 - f) + tr[j + 1] * f;
-                let w = if weighted { if t > 0.0 { t0 / t } else { 1.0 } } else { 1.0 };
-                acc += val * w;
+                let val = tr[g.sample] * (1.0 - g.fraction) + tr[g.sample + 1] * g.fraction;
+                acc += val * g.weight;
                 wsum += 1.0;
             }
             out.data[x0 as usize * ns + i] = if wsum > 0.0 { acc / wsum } else { 0.0 };
         }
     }
     out
+}
+
+/// Zero-offset, 2-D constant-velocity depth migration from measured antenna positions.
+/// Coordinates are horizontal chainage x and elevation z (up); output is depth below
+/// the highest antenna elevation. The input is always the unshifted time section.
+/// Travel time and obliquity follow Dujardin & Bano (2013), doi:10.1016/j.crte.2013.01.003;
+/// the discrete derivative and valid-trace normalization retain this app's flat operator.
+fn topographic_kirchhoff(
+    s: &Section, ctx: &Ctx, geometry: &TopographicGeometry, v: f32, width: usize,
+    t_start: f32, t_end: f32, gps_above_antenna_m: f32,
+) -> Result<Section, String> {
+    if !v.is_finite() || v <= 0.0 || !s.dt.is_finite() || s.dt <= 0.0 || !s.t0.is_finite() || !gps_above_antenna_m.is_finite() {
+        return Err("Topographic Kirchhoff needs finite positive velocity and sample interval, a finite first time, and a finite antenna-height correction.".into());
+    }
+    if geometry.x_m.len() != s.ntr || geometry.elevation_m.len() != s.ntr || s.ntr < 2 || s.ns < 2 {
+        return Err("Topographic Kirchhoff geometry must cover every trace.".into());
+    }
+    let height = gps_above_antenna_m as f64;
+    let datum = geometry.elevation_m.iter().map(|z| z - height).fold(f64::NEG_INFINITY, f64::max);
+    let lowest = geometry.elevation_m.iter().map(|z| z - height).fold(f64::INFINITY, f64::min);
+    if !datum.is_finite() || !lowest.is_finite() || geometry.elevation_m.iter().any(|z| !z.is_finite()) || geometry.x_m.windows(2).any(|p| !p[0].is_finite() || !p[1].is_finite() || p[1] <= p[0]) {
+        return Err("Topographic Kirchhoff geometry contains invalid elevations or horizontal spacing.".into());
+    }
+    let dz = s.dt * v / 2.0;
+    let relief_samples = ((datum - lowest) / dz as f64).ceil() as usize;
+    let ns = s.ns.checked_add(relief_samples).ok_or("Topographic output grid is too large.")?;
+    let len = ns.checked_mul(s.ntr).ok_or("Topographic output grid is too large.")?;
+    let mut out = Section { ns, ntr: s.ntr, dt: dz, t0: s.t0 * v / 2.0, depth_axis: true, depth_datum_m: Some(datum), data: vec![f32::NAN; len] };
+    let mut derivative = s.clone();
+    for tr in 0..s.ntr {
+        let src = s.trace(tr);
+        let dst = derivative.trace_mut(tr);
+        for i in 0..s.ns {
+            let left = if i > 0 { src[i - 1] } else { src[i] };
+            let right = if i + 1 < s.ns { src[i + 1] } else { src[i] };
+            dst[i] = (right - left) * 0.5;
+        }
+    }
+    let half = (width.max(1) / 2).min(s.ntr) as isize;
+    for x0 in 0..s.ntr {
+        if x0 % 16 == 0 {
+            ctx.tick(x0 as f32 / s.ntr as f32);
+            if ctx.cancelled() { break; }
+        }
+        let surface_depth = datum - (geometry.elevation_m[x0] - height);
+        for i in 0..ns {
+            let depth = out.y_of(i as f32) as f64;
+            let local_depth = depth - surface_depth;
+            if local_depth < 0.0 { continue; }
+            let local_time = 2.0 * local_depth / v as f64;
+            if local_time < t_start as f64 || local_time > t_end as f64 { continue; }
+            let mut sum = 0f32;
+            let mut count = 0f32;
+            for offset in -half..=half {
+                let x = x0 as isize + offset;
+                if x < 0 || x >= s.ntr as isize { continue; }
+                let x = x as usize;
+                let vertical = depth - (datum - (geometry.elevation_m[x] - height));
+                if vertical < 0.0 { continue; }
+                let horizontal = geometry.x_m[x] - geometry.x_m[x0];
+                let distance = horizontal.hypot(vertical);
+                let time = 2.0 * distance / v as f64;
+                let sample = s.sample_of(time as f32);
+                if sample < 0.0 || sample >= (s.ns - 1) as f32 { continue; }
+                let j = sample.floor() as usize;
+                let f = sample - j as f32;
+                let tr = derivative.trace(x);
+                let amplitude = tr[j] * (1.0 - f) + tr[j + 1] * f;
+                let weight = if distance > 0.0 { (vertical / distance) as f32 } else { 1.0 };
+                sum += amplitude * weight;
+                count += 1.0;
+            }
+            out.data[x0 * ns + i] = if count > 0.0 { sum / count } else { 0.0 };
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod topographic_migration_tests {
+    use super::*;
+
+    // Independent forward model: each zero-offset trace records a smoothed step at
+    // two-way Euclidean travel time from its own antenna to one point diffractor.
+    fn diffraction(x: &[f64], surface: &[f64], target_x: f64, target_z: f64, t0: f32) -> Section {
+        let mut s = Section::new(360, x.len(), 0.25);
+        s.t0 = t0;
+        for tr in 0..x.len() {
+            let arrival = 2.0 * (x[tr] - target_x).hypot(surface[tr] - target_z) / 0.1;
+            for i in 0..s.ns {
+                let t = s.y_of(i as f32) as f64;
+                s.data[tr * s.ns + i] = ((t - arrival) / 0.75).tanh() as f32;
+            }
+        }
+        s
+    }
+
+    fn migrate(s: &Section, x: &[f64], z: &[f64]) -> Section {
+        let ctx = Ctx::default();
+        topographic_kirchhoff(s, &ctx, &TopographicGeometry { x_m: x.to_vec(), elevation_m: z.to_vec() }, 0.1, x.len() * 2, 0.0, 1e9, 0.0).unwrap()
+    }
+
+    #[test]
+    fn focuses_flat_slope_and_uneven_with_nonuniform_spacing_and_time_origin() {
+        let x: Vec<f64> = (0..61).map(|i| i as f64 * 0.1 + (i as f64 * 0.31).sin() * 0.005).collect();
+        for shape in 0..3 {
+            let surface: Vec<f64> = x.iter().map(|xx| match shape { 0 => 100.0, 1 => 100.0 + 0.12 * xx, _ => 100.0 + 0.35 * (xx * 0.7).sin() + 0.09 * xx }).collect();
+            let target_x = x[30];
+            let target_z = surface.iter().copied().fold(f64::INFINITY, f64::min) - 2.5;
+            let s = diffraction(&x, &surface, target_x, target_z, 3.25);
+            let o = migrate(&s, &x, &surface);
+            let datum = o.depth_datum_m.unwrap();
+            let expected_sample = o.sample_of((datum - target_z) as f32).round() as isize;
+            let mut best = (f32::NEG_INFINITY, 0usize, 0isize);
+            for tr in 10..51 {
+                for j in expected_sample - 8..=expected_sample + 8 {
+                    let v = o.value(tr, j as usize);
+                    if v > best.0 { best = (v, tr, j); }
+                }
+            }
+            assert!((x[best.1] - target_x).abs() <= 0.15, "shape {shape}: x={} vs {target_x}", x[best.1]);
+            assert!((o.y_of(best.2 as f32) as f64 - (datum - target_z)).abs() <= 0.15, "shape {shape}: depth error");
+            assert!(best.0 > 0.05, "shape {shape}: weak focus");
+        }
+    }
+
+    #[test]
+    fn flat_limit_matches_existing_kirchhoff_on_same_depth_grid() {
+        let x: Vec<f64> = (0..41).map(|i| i as f64 * 0.1).collect();
+        let z = vec![100.0; x.len()];
+        let s = diffraction(&x, &z, 2.0, 97.0, 0.0);
+        let topo = migrate(&s, &x, &z);
+        let flat = kirchhoff(&s, &Ctx { dx: 0.1, ..Default::default() }, 0.1, x.len() * 2, 0.0, 1e9, true);
+        assert_eq!(topo.ns, flat.ns);
+        let max_diff = topo.data.iter().zip(flat.data.iter()).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+        assert!(max_diff < 0.002, "flat limit max amplitude difference {max_diff}");
+    }
+
+    #[test]
+    fn uneven_surface_focus_exceeds_flat_migration_with_display_shift() {
+        let x: Vec<f64> = (0..61).map(|i| i as f64 * 0.1).collect();
+        let z: Vec<f64> = x.iter().map(|xx| 100.0 + 0.7 * (xx * 0.8).sin() + 0.1 * xx).collect();
+        let target_x = 3.0;
+        let target_z = z.iter().copied().fold(f64::INFINITY, f64::min) - 2.0;
+        let s = diffraction(&x, &z, target_x, target_z, 0.0);
+        let topo = migrate(&s, &x, &z);
+        let flat = kirchhoff(&s, &Ctx { dx: 0.1, ..Default::default() }, 0.1, x.len() * 2, 0.0, 1e9, true);
+        let datum = topo.depth_datum_m.unwrap();
+        let top_sample = topo.sample_of((datum - target_z) as f32).round() as usize;
+        let local_depth = z[30] - target_z;
+        let flat_sample = flat.sample_of((2.0 * local_depth / 0.1) as f32).round() as usize;
+        let topo_amp = topo.value(30, top_sample);
+        let shifted_flat_amp = flat.value(30, flat_sample);
+        assert!(topo_amp > shifted_flat_amp * 1.2, "topographic focus {topo_amp}, shifted flat {shifted_flat_amp}");
+    }
+
+    #[test]
+    fn rejects_invalid_geometry() {
+        let s = Section::new(20, 3, 0.2);
+        for (x,z) in [(vec![0.0, 0.0, 1.0], vec![1.0;3]), (vec![0.0, 1.0, 2.0], vec![1.0, f64::NAN, 1.0])] {
+            assert!(topographic_kirchhoff(&s, &Ctx::default(), &TopographicGeometry { x_m:x, elevation_m:z }, 0.1, 3, 0.0, 100.0, 0.0).is_err());
+        }
+    }
 }
 
 /// Stolt FK migration for constant velocity (exploding reflector, v/2).
@@ -926,6 +1133,134 @@ pub fn snap_sample(tr: &[f32], s: f32, win: usize, mode: Snap) -> f32 {
                 }
             }
             best
+        }
+    }
+}
+
+#[cfg(test)]
+mod performance_measurements {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn synthetic_processing() {
+        for (name, ntr, ns) in [("small", 600, 512), ("large", 2400, 1024)] {
+            let mut raw = Section::new(ns, ntr, 0.25);
+            for tr in 0..ntr {
+                for s in 0..ns {
+                    let x = (tr * 37 + s * 13) as f32;
+                    raw.data[tr * ns + s] = (x * 0.017).sin() + (x * 0.003).cos();
+                }
+            }
+            let ctx = Ctx { dx: 0.05, freq_mhz: 500.0, ..Default::default() };
+            let steps = [
+                Step::Dewow { window_ns: 5.0 },
+                Step::BandpassFrequency { f1: 100.0, f2: 200.0, f3: 600.0, f4: 900.0, taper: Taper::Cos },
+                Step::DiffractionStack { velocity: 0.1, width: 40 },
+                Step::KirchhoffMigration { velocity: 0.1, width: 40, t_start: 0.0, t_end: 1e9 },
+                Step::FkMigration { velocity: 0.1, scale: 2.0 },
+                Step::TimeDepth { velocity: 0.1, max_depth: 0.0 },
+            ];
+            println!("DATASET {name} {ntr}x{ns} {:.1} MiB", raw.data.len() as f64 * 4.0 / 1_048_576.0);
+            for step in &steps {
+                let start = Instant::now();
+                let result = step.apply(&raw, &ctx).unwrap();
+                std::hint::black_box(result);
+                println!("STEP {name} {:<25} {:.3} s", step.name(), start.elapsed().as_secs_f64());
+            }
+            let entries: Vec<_> = steps.iter().cloned().map(|step| StepEntry { enabled: true, step }).collect();
+            let start = Instant::now();
+            let result = run_all(&raw, &entries, &ctx);
+            std::hint::black_box(result);
+            println!("SEQUENCE {name} {:.3} s", start.elapsed().as_secs_f64());
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn topographic_profiles() {
+        for (name, ntr, ns) in [("small", 600usize, 512usize), ("large", 2400, 1024)] {
+            let mut raw = Section::new(ns, ntr, 0.1);
+            for (i, a) in raw.data.iter_mut().enumerate() { *a = (i as f32 * 0.011).sin(); }
+            let geometry = TopographicGeometry {
+                x_m: (0..ntr).map(|i| i as f64 * 0.05).collect(),
+                elevation_m: (0..ntr).map(|i| 500.0 + (i as f64 * 0.01).sin() * 0.4).collect(),
+            };
+            let flat_start = Instant::now();
+            let flat = kirchhoff(&raw, &Ctx { dx: 0.05, ..Default::default() }, 0.1, 80, 0.0, 1e9, true);
+            println!("FLAT PERF {name}: {:.3} s", flat_start.elapsed().as_secs_f64());
+            std::hint::black_box(flat);
+            let start = Instant::now();
+            let out = topographic_kirchhoff(&raw, &Ctx::default(), &geometry, 0.1, 80, 0.0, 1e9, 0.0).unwrap();
+            let elapsed = start.elapsed().as_secs_f64();
+            println!("TOPO PERF {name}: {ntr}x{ns} input, {} output rows, {:.3} s; input {:.1} MiB, output {:.1} MiB, derivative {:.1} MiB", out.ns, elapsed, raw.data.len() as f64 * 4.0 / 1_048_576.0, out.data.len() as f64 * 4.0 / 1_048_576.0, raw.data.len() as f64 * 4.0 / 1_048_576.0);
+            std::hint::black_box(out);
+        }
+    }
+}
+
+#[cfg(test)]
+mod migration_regression {
+    use super::*;
+
+    // The pre-optimization formula, kept here as a numerical reference.
+    fn original(s: &Section, ctx: &Ctx, v: f32, width: usize, t_start: f32, t_end: f32, weighted: bool) -> Section {
+        let (ns, ntr) = (s.ns, s.ntr);
+        let mut input = s.clone();
+        if weighted {
+            for t in 0..ntr {
+                let tr = input.trace_mut(t);
+                let orig = tr.to_vec();
+                for i in 0..ns {
+                    let a = if i > 0 { orig[i - 1] } else { orig[i] };
+                    let b = if i + 1 < ns { orig[i + 1] } else { orig[i] };
+                    tr[i] = (b - a) * 0.5;
+                }
+            }
+        }
+        let half = (width.max(1) / 2) as isize;
+        let (a, b) = sample_range(s, t_start, t_end);
+        let mut out = s.clone();
+        let k = 2.0 * ctx.dx / v.max(1e-4);
+        for x0 in 0..ntr as isize {
+            for i in a..b {
+                let t0 = s.y_of(i as f32).max(0.0);
+                let mut acc = 0f32;
+                let mut wsum = 0f32;
+                for dxi in -half..=half {
+                    let x = x0 + dxi;
+                    if x < 0 || x >= ntr as isize { continue; }
+                    let off = k * dxi as f32;
+                    let t = (t0 * t0 + off * off).sqrt();
+                    let si = s.sample_of(t);
+                    if si < 0.0 || si >= (ns - 1) as f32 { continue; }
+                    let j = si.floor() as usize;
+                    let f = si - j as f32;
+                    let tr = input.trace(x as usize);
+                    let val = tr[j] * (1.0 - f) + tr[j + 1] * f;
+                    let w = if weighted { if t > 0.0 { t0 / t } else { 1.0 } } else { 1.0 };
+                    acc += val * w;
+                    wsum += 1.0;
+                }
+                out.data[x0 as usize * ns + i] = if wsum > 0.0 { acc / wsum } else { 0.0 };
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn geometry_reuse_preserves_migration_values() {
+        let mut s = Section::new(35, 19, 0.25);
+        s.t0 = -1.0;
+        for (i, v) in s.data.iter_mut().enumerate() { *v = (i as f32 * 0.37).sin(); }
+        let ctx = Ctx { dx: 0.07, ..Default::default() };
+        for weighted in [false, true] {
+            for (start, end) in [(0.0, 1e9), (1.0, 4.0)] {
+                let old = original(&s, &ctx, 0.13, 8, start, end, weighted);
+                let new = kirchhoff(&s, &ctx, 0.13, 8, start, end, weighted);
+                assert_eq!(new.data, old.data);
+            }
         }
     }
 }

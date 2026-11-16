@@ -367,7 +367,8 @@ impl App {
     /// Process on the calling thread (small jobs, start-up and self-test).
     pub fn reprocess(&mut self, i: usize) {
         let p = &self.profiles[i];
-        let ctx = Ctx { dx: p.dx, freq_mhz: p.freq_mhz, ..Default::default() };
+        let (topography, topography_error) = processing::topography_for_steps(p, &self.project_crs);
+        let ctx = Ctx { dx: p.dx, freq_mhz: p.freq_mhz, topography, topography_error, ..Default::default() };
         let (proc, log) = processing::run_all(&p.raw, &p.steps, &ctx);
         self.apply_processed(i, proc, log);
     }
@@ -378,7 +379,7 @@ impl App {
         p.log = log;
         p.version += 1;
         // A time-depth step defines the velocity used for depth.
-        if let Some(v) = p.steps.iter().rev().find_map(|e| if let (true, Step::TimeDepth { velocity, .. }) = (e.enabled, &e.step) { Some(*velocity) } else { None }) {
+        if let Some(v) = p.steps.iter().rev().find_map(|e| if e.enabled { match &e.step { Step::TimeDepth { velocity, .. } => Some(*velocity), _ => None } } else { None }) {
             p.velocity = v;
         }
         let (ns, ntr) = (p.proc.ns as f32, p.proc.ntr as f32);
@@ -654,6 +655,16 @@ impl App {
                         dv(ui, "Start time", t_start, 0.5, " ns");
                         dv(ui, "End time", t_end, 0.5, " ns");
                     }
+                    Step::TopographicKirchhoff { velocity, width, t_start, t_end, gps_above_antenna_m, max_gap_m } => {
+                        dv(ui, "Velocity", velocity, 0.001, " m/ns");
+                        ui.label("Summation width (traces)");
+                        ui.add(egui::DragValue::new(width).range(2..=4000));
+                        ui.end_row();
+                        dv(ui, "Start local time", t_start, 0.5, " ns");
+                        dv(ui, "End local time", t_end, 0.5, " ns");
+                        dv(ui, "GPS receiver above antenna", gps_above_antenna_m, 0.01, " m");
+                        dv(ui, "Maximum measured GPS gap", max_gap_m, 0.1, " m");
+                    }
                     Step::FkMigration { velocity, scale } => {
                         dv(ui, "Velocity", velocity, 0.001, " m/ns");
                         dv(ui, "Time window factor", scale, 0.1, "");
@@ -664,9 +675,17 @@ impl App {
                     }
                 }
             });
+            if let Step::TopographicKirchhoff { max_gap_m, .. } = &ed.step {
+                ui.label("Uses measured GPS elevations and horizontal positions. A zero height correction assumes GPS height is antenna height. Output is depth below the highest antenna elevation.");
+                if let Some(p) = self.active_profile() {
+                    if let Err(e) = p.topographic_geometry(&self.project_crs, *max_gap_m) {
+                        ui.colored_label(Color32::from_rgb(180, 75, 0), e);
+                    }
+                }
+            }
             if let Some(pv) = prof_v {
                 match &mut ed.step {
-                    Step::DiffractionStack { velocity, .. } | Step::KirchhoffMigration { velocity, .. } | Step::FkMigration { velocity, .. } | Step::TimeDepth { velocity, .. } => {
+                    Step::DiffractionStack { velocity, .. } | Step::KirchhoffMigration { velocity, .. } | Step::TopographicKirchhoff { velocity, .. } | Step::FkMigration { velocity, .. } | Step::TimeDepth { velocity, .. } => {
                         if ui.button(format!("Use profile velocity ({pv:.3} m/ns)")).clicked() {
                             *velocity = pv;
                         }
@@ -717,7 +736,8 @@ impl App {
     }
 
     pub fn open_step(&mut self, step: Step) {
-        let spectrum = self.active_profile().map(|p| if !p.proc.depth_axis { processing::mean_spectrum(&p.proc) } else { vec![] }).unwrap_or_default();
+        let needs_spectrum = matches!(step, Step::BandpassFrequency { .. } | Step::BandpassButterworth { .. });
+        let spectrum = if needs_spectrum { self.active_profile().map(|p| if !p.proc.depth_axis { processing::mean_spectrum(&p.proc) } else { vec![] }).unwrap_or_default() } else { vec![] };
         // Sensible defaults from the active profile.
         let mut step = step;
         if let Some(p) = self.active_profile() {
@@ -734,7 +754,7 @@ impl App {
                     *f_high = f * 2.0;
                 }
                 Step::Dewow { window_ns } => *window_ns = (1000.0 / f).max(p.proc.dt),
-                Step::DiffractionStack { velocity, .. } | Step::KirchhoffMigration { velocity, .. } | Step::FkMigration { velocity, .. } | Step::TimeDepth { velocity, .. } => *velocity = p.velocity,
+                Step::DiffractionStack { velocity, .. } | Step::KirchhoffMigration { velocity, .. } | Step::TopographicKirchhoff { velocity, .. } | Step::FkMigration { velocity, .. } | Step::TimeDepth { velocity, .. } => *velocity = p.velocity,
                 _ => {}
             }
         }
@@ -1376,7 +1396,7 @@ impl App {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for (m, icon, tip) in [
-                    (PickMode::Navigate, "✋ Navigate", "Drag to pan; wheel or side wheel: slide along the profile; Shift + wheel: time axis from 0 down to the depth you want; Ctrl + wheel: zoom horizontally (zooming out past the profile makes the plot narrower, never stretched); double-click to fit; Ctrl+S saves the project"),
+                    (PickMode::Navigate, "✋ Navigate", "Drag to pan; wheel: scroll vertically; side wheel: slide along the profile; Shift + wheel: time axis from 0 down to the depth you want; Ctrl + wheel: zoom horizontally (zooming out past the profile makes the plot narrower, never stretched); double-click to fit; Ctrl+S saves the project"),
                     (PickMode::Point, "+ Point", "Click to place a point marker.\nRight-click a pick to delete it; Shift + right-drag deletes all picks in a box.\nOnly picks of the type selected in the toolbar are deleted."),
                     (PickMode::Hyperbola, "^ Hyperbola", "Click the apex, drag a flank to fit the velocity, Enter saves.\nRight-click a hyperbola to delete it."),
                     (PickMode::Layer, "~ Layer", "Click along a reflector; double-click (or Enter) ends the line and the next click starts a new one.\nBackspace removes the last point; right-click deletes a pick; Shift + right-drag deletes picks in a box."),
@@ -1437,6 +1457,19 @@ impl App {
                         let (id, ntr, ns) = (p.id, p.proc.ntr as f32, p.proc.ns as f32);
                         self.views.insert(id, ViewState { tr0: 0.0, tr1: ntr, s0: 0.0, s1: ns });
                     }
+                }
+                if ui.add_enabled(self.profiles.iter().any(Profile::has_coords), egui::Button::new("Orient profiles"))
+                    .on_hover_text("Use GPS direction to show each profile west-to-east or north-to-south; picks and source data stay in acquisition order")
+                    .clicked()
+                {
+                    let mut oriented = 0;
+                    for p in &mut self.profiles {
+                        if let Some(reverse) = p.auto_orientation(&self.project_crs) {
+                            p.reverse_display = reverse;
+                            oriented += 1;
+                        }
+                    }
+                    self.status = format!("Oriented {oriented} profile(s) from GPS; profiles without a clear direction were skipped.");
                 }
             });
         });
@@ -1509,7 +1542,9 @@ impl App {
                 });
                 let can_topo = p.has_topo();
                 ui.horizontal(|ui| {
-                    let tip = if can_topo {
+                    let tip = if p.proc.depth_datum_m.is_some() {
+                        "Display only. This topographic migration already has its own elevation grid, so this checkbox does not shift it.".to_string()
+                    } else if can_topo {
                         format!("Time zero follows the GPS elevation: each trace moves down by 2·(highest − its elevation)/v, v = {:.3} m/ns (the v value in the toolbar). Display only.", p.velocity)
                     } else {
                         "Needs GPS positions with elevations that vary along the profile.".to_string()
@@ -1525,7 +1560,7 @@ impl App {
             ui.heading("Processing sequence");
             let all = Step::defaults();
             ui.horizontal_wrapped(|ui| {
-                for (i, short) in [(0, "Time 0"), (1, "Dewow"), (3, "Background"), (6, "AGC"), (8, "Gain f(t)"), (7, "Energy decay"), (4, "Bandpass"), (5, "Butterworth"), (11, "Moving avg."), (16, "Avg xy"), (13, "Kirchhoff"), (14, "FK Stolt"), (15, "Time-depth")] {
+                for (i, short) in [(0, "Time 0"), (1, "Dewow"), (3, "Background"), (6, "AGC"), (8, "Gain f(t)"), (7, "Energy decay"), (4, "Bandpass"), (5, "Butterworth"), (11, "Moving avg."), (16, "Avg xy"), (13, "Kirchhoff"), (17, "Topo Kirchhoff"), (14, "FK Stolt"), (15, "Time-depth")] {
                     if ui.small_button(short).on_hover_text(all[i].name()).clicked() {
                         self.open_step(all[i].clone());
                     }
@@ -1576,7 +1611,9 @@ impl App {
                 }
                 if let Some(k) = edit {
                     let step = self.profiles[a].steps[k].step.clone();
-                    let spectrum = processing::mean_spectrum(&self.profiles[a].raw);
+                    let spectrum = if matches!(step, Step::BandpassFrequency { .. } | Step::BandpassButterworth { .. }) {
+                        processing::mean_spectrum(&self.profiles[a].raw)
+                    } else { vec![] };
                     self.step_editor = Some(StepEditor { step, index: Some(k), spectrum });
                 }
                 ui.horizontal(|ui| {
@@ -1660,8 +1697,12 @@ impl App {
                 self.task_status_ui(ui);
                 if let (Some(p), Some((tr, y))) = (self.active_profile(), self.hover) {
                     let t = self.y_to_pick_time(p, y);
-                    let mut s = format!("trace {:.0}  x {:.2} m  ", tr + 1.0, p.dist_at(tr));
-                    if p.proc.depth_axis {
+                    let mut s = format!("trace {:.0}  x {:.2} m  ", tr + 1.0, p.axis_dist_at(tr));
+                    if let Some(datum) = p.proc.depth_datum_m {
+                        let local = p.coord_at(tr).map(|c| c[2] - p.antenna_height_correction() - (datum - y as f64));
+                        s.push_str(&format!("depth below datum {:.3} m  elevation {:.3} m  ", y, datum - y as f64));
+                        if let Some(d) = local { s.push_str(&format!("local depth {:.3} m  ", d)); }
+                    } else if p.proc.depth_axis {
                         s.push_str(&format!("depth {:.3} m  ", y));
                     } else {
                         s.push_str(&format!("t {:.2} ns  depth {:.3} m  ", t, p.depth_of_time(t)));
@@ -1725,10 +1766,12 @@ impl App {
     /// Ask to save the project when the window is closed.
     fn close_question_ui(&mut self, ctx: &egui::Context) {
         let close_req = ctx.input(|i| i.viewport().close_requested());
-        let unsaved = !self.profiles.is_empty() && self.saved_snapshot.as_deref() != Some(crate::project::snapshot(self).as_str());
-        if close_req && !self.allow_close && self.screenshot.is_none() && unsaved {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.confirm_close = true;
+        if close_req && !self.allow_close && self.screenshot.is_none() {
+            let unsaved = !self.profiles.is_empty() && self.saved_snapshot.as_deref() != Some(crate::project::snapshot(self).as_str());
+            if unsaved {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.confirm_close = true;
+            }
         }
         if !self.confirm_close {
             return;
@@ -1876,5 +1919,39 @@ impl eframe::App for App {
         self.task_popup_ui(ctx);
         self.close_question_ui(ctx);
         self.handle_screenshot(ctx);
+    }
+}
+
+#[cfg(test)]
+mod performance_measurements {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn synthetic_interface_work() {
+        let mut app = App::headless(vec![], None);
+        let mut s = crate::model::Section::new(1024, 2400, 0.25);
+        for (i, v) in s.data.iter_mut().enumerate() { *v = (i as f32 * 0.01).sin(); }
+        let id = app.add_profile(Profile::new("large".into(), PathBuf::new(), "test", s, 0.05));
+        let p = &mut app.profiles[0];
+        p.coords = (0..p.raw.ntr).map(|i| [i as f64 * 0.05, 0.0, (i as f64 * 0.01).sin()]).collect();
+        p.show_topo = true;
+        for i in 0..1000 {
+            app.markers.push(Marker { id: i + 1, profile_id: id, type_idx: 0, trace: i as f32, time_ns: 10.0, amplitude: 0.0, velocity: None, comment: String::new() });
+        }
+        let t = Instant::now();
+        for _ in 0..100 { std::hint::black_box(crate::project::snapshot(&app)); }
+        println!("INTERFACE snapshot {:.3} ms/call", t.elapsed().as_secs_f64() * 10.0);
+        let p = &app.profiles[0];
+        let t = Instant::now();
+        for _ in 0..100 { std::hint::black_box(p.topo_shifts()); }
+        println!("INTERFACE topography {:.3} ms/call", t.elapsed().as_secs_f64() * 10.0);
+        let t = Instant::now();
+        for _ in 0..10 { std::hint::black_box(crate::render::render(&p.proc, 0.0, p.proc.ntr as f32, 0.0, p.proc.ns as f32, 1200, 700, app.colormap, 1.0)); }
+        println!("INTERFACE radargram {:.3} ms/frame", t.elapsed().as_secs_f64() * 100.0);
+        let t = Instant::now();
+        for _ in 0..10 { std::hint::black_box(processing::mean_spectrum(&p.proc)); }
+        println!("INTERFACE spectrum {:.3} ms/call", t.elapsed().as_secs_f64() * 100.0);
     }
 }

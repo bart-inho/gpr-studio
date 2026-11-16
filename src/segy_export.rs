@@ -10,6 +10,7 @@ use egui::{Color32, RichText};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct SegyMeta {
     pub name: String,
     pub source: String,
@@ -29,6 +30,8 @@ pub struct SegyJob {
     pub reload: Option<(PathBuf, usize, crate::formats::ImportOptions)>,
     pub raw: Option<Section>,
     pub steps: Vec<StepEntry>,
+    pub topography: Option<Arc<crate::processing::TopographicGeometry>>,
+    pub topography_error: Option<String>,
     /// Stages to write: 0 = raw, k = after step k (1-based).
     pub stages: Vec<usize>,
     pub out_dir: PathBuf,
@@ -88,6 +91,27 @@ pub fn safe_name(s: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
+#[cfg(test)]
+mod topographic_export_tests {
+    use super::*;
+
+    #[test]
+    fn segy_records_datum_and_no_data_mask() {
+        let mut sec = Section::new(3, 2, 0.005);
+        sec.depth_axis = true;
+        sec.depth_datum_m = Some(500.0);
+        sec.data = vec![f32::NAN, 2.0, 3.0, f32::NAN, f32::NAN, 6.0];
+        let meta = SegyMeta { name: "topo".into(), source: "synthetic".into(), line_no: 1, coords: vec![[2_600_000.0, 1_200_000.0, 500.0], [2_600_001.0, 1_200_000.0, 499.9]], dist: vec![0.0, 1.0], crs_label: "EPSG:2056".into(), geographic: false, freq_mhz: 400.0, velocity: 0.1, dx: 1.0 };
+        let path = Path::new("target/topographic-export-test.sgy");
+        write(path, &sec, &meta, "MIGRATED", &[]).unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[3600 + 240..3600 + 244], &f32::NAN.to_be_bytes());
+        assert_eq!(&bytes[3600 + 244..3600 + 248], &2.0f32.to_be_bytes());
+        assert_eq!(i32::from_be_bytes(bytes[3600 + 40..3600 + 44].try_into().unwrap()), 50000);
+        assert_eq!(i32::from_be_bytes(bytes[3600 + 240 + 12 + 40..3600 + 240 + 12 + 44].try_into().unwrap()), 49990);
+    }
+}
+
 /// Write one section as SEG-Y. `stage` describes the processing for the text header.
 pub fn write(path: &Path, sec: &Section, m: &SegyMeta, stage: &str, steps: &[String]) -> Result<(), String> {
     let ns = sec.ns.min(65535);
@@ -120,6 +144,7 @@ pub fn write(path: &Path, sec: &Section, m: &SegyMeta, stage: &str, steps: &[Str
         "ELEVATION BYTES 41-44 AND 45-48: METRES, SCALAR BYTE 69 = -100 (CM)".into(),
         "DISTANCE ALONG PROFILE: BYTES 197-200 (SHOT POINT), SCALAR BYTE 201 = -100".into(),
         "TRACE NUMBER: BYTES 1-4, 5-8, 9-12, 21-24 (CDP), 193-196 (CROSSLINE)".into(),
+        if let Some(datum) = sec.depth_datum_m { format!("TOPO KIRCHHOFF: DEPTH BELOW DATUM {:.3} M ELEVATION; IEEE NAN ABOVE SURFACE", datum) } else { "VERTICAL REFERENCE: TIME OR DEPTH BELOW LOCAL SURFACE".into() },
         "PROCESSING STEPS:".into(),
     ];
     if steps.is_empty() {
@@ -189,7 +214,7 @@ pub fn write(path: &Path, sec: &Section, m: &SegyMeta, stage: &str, steps: &[Str
         be16(&mut h, 200, -100);
         out.extend_from_slice(&h);
         for v in &sec.trace(t)[..ns] {
-            out.extend_from_slice(&(if v.is_finite() { *v } else { 0.0 }).to_be_bytes());
+            out.extend_from_slice(&(if sec.depth_datum_m.is_some() { *v } else if v.is_finite() { *v } else { 0.0 }).to_be_bytes());
         }
     }
     std::fs::write(path, out).map_err(|e| format!("{}: {e}", path.display()))
@@ -219,6 +244,8 @@ pub fn run(jobs: Vec<SegyJob>, prog: &Arc<Progress>) -> (Vec<String>, Vec<String
         };
         let last = job.stages.iter().copied().max().unwrap_or(0);
         let mut cur = raw;
+        let mut topo_height_correction = 0.0f64;
+        let mut topo_velocity = None;
         let mut done_steps: Vec<String> = Vec::new();
         let total = last.max(1) as f32;
         for stage in 0..=last {
@@ -232,9 +259,17 @@ pub fn run(jobs: Vec<SegyJob>, prog: &Arc<Progress>) -> (Vec<String>, Vec<String
                     let span = 1.0 / n as f32;
                     prog.set_range(base + span * (stage - 1) as f32 / total, base + span * stage as f32 / total);
                     prog.set_text(format!("profile {}/{n}: {} — {}", k + 1, job.meta.name, e.step.name()));
-                    let ctx = Ctx { dx: job.meta.dx, freq_mhz: job.meta.freq_mhz, progress: Some(prog.clone()), label: String::new() };
+                    let ctx = Ctx { dx: job.meta.dx, freq_mhz: job.meta.freq_mhz, progress: Some(prog.clone()), label: String::new(), topography: job.topography.clone(), topography_error: job.topography_error.clone() };
                     match e.step.apply(&cur, &ctx) {
-                        Ok(s) => cur = s,
+                        Ok(s) => {
+                            if s.depth_datum_m.is_some() && cur.depth_datum_m.is_none() {
+                                if let crate::processing::Step::TopographicKirchhoff { gps_above_antenna_m, velocity, .. } = &e.step {
+                                    topo_height_correction = *gps_above_antenna_m as f64;
+                                    topo_velocity = Some(*velocity);
+                                }
+                            }
+                            cur = s;
+                        }
                         Err(err) => errors.push(format!("{}: step {} skipped ({err})", job.meta.name, stage)),
                     }
                     prog.set_range(k as f32 / n as f32, (k + 1) as f32 / n as f32);
@@ -252,7 +287,13 @@ pub fn run(jobs: Vec<SegyJob>, prog: &Arc<Progress>) -> (Vec<String>, Vec<String
                 };
                 let file = job.out_dir.join(format!("{}_{}.sgy", safe_name(&job.meta.name), tag));
                 prog.set_text(format!("profile {}/{n}: {} — writing {}", k + 1, job.meta.name, file.file_name().and_then(|s| s.to_str()).unwrap_or("")));
-                match write(&file, &cur, &job.meta, &label, &done_steps) {
+                let mut meta = job.meta.clone();
+                if cur.depth_datum_m.is_some() {
+                    for c in &mut meta.coords { c[2] -= topo_height_correction; }
+                    if let Some(g) = &job.topography { meta.dist = g.x_m.clone(); }
+                    if let Some(v) = topo_velocity { meta.velocity = v; }
+                }
+                match write(&file, &cur, &meta, &label, &done_steps) {
                     Ok(()) => written.push(file.display().to_string()),
                     Err(e) => errors.push(e),
                 }
@@ -330,6 +371,7 @@ impl App {
                         continue;
                     }
                     let real_file = p.path.exists() && !p.format.starts_with("Demo");
+                    let (topography, topography_error) = crate::processing::topography_for_steps(p, &self.project_crs);
                     jobs.push(SegyJob {
                         meta: SegyMeta {
                             name: p.name.clone(),
@@ -346,6 +388,8 @@ impl App {
                         reload: if real_file { Some((p.path.clone(), p.channel, self.import_opts.clone())) } else { None },
                         raw: if real_file { None } else { Some(p.raw.clone()) },
                         steps: p.steps.clone(),
+                        topography,
+                        topography_error,
                         stages: st,
                         out_dir: dir.clone(),
                     });

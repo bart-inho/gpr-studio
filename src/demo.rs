@@ -72,7 +72,7 @@ pub fn make() -> Vec<Profile> {
         for tr in (0..ntr).step_by(10).chain(std::iter::once(ntr - 1)) {
             let d = tr as f64 * dx as f64;
             let wob = 0.15 * (d * 0.4).sin();
-            fixes.push(GpsFix { trace: tr as f64, x: e0 + d * h.cos() - wob * h.sin(), y: n0 + d * h.sin() + wob * h.cos(), z: 540.0 + 0.05 * d });
+            fixes.push(GpsFix { trace: tr as f64, x: e0 + d * h.cos() - wob * h.sin(), y: n0 + d * h.sin() + wob * h.cos(), z: 540.0 + 0.05 * d, has_elevation: true });
         }
         p.gps = Some(GpsTrack { source: "demo GPS (LV95)".into(), crs: CrsSpec::Epsg(2056), fixes });
         out.push(p);

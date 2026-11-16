@@ -21,7 +21,7 @@ pub enum Pending {
 }
 
 pub enum Output {
-    Processed(Vec<(u32, Section, Vec<String>)>),
+    Processed(Vec<(u32, Section, Vec<String>, Vec<processing::StepEntry>, f32, f32, Option<crate::model::GpsTrack>, crate::crs::CrsSpec)>),
     Imported(Vec<Profile>, Vec<String>),
     Project(Box<crate::project::Loaded>),
     Exported(Vec<String>, Vec<String>),
@@ -103,34 +103,20 @@ impl App {
     fn begin(&mut self, job: Pending) {
         match job {
             Pending::Process(ids) => {
-                let jobs: Vec<(u32, String, Section, Vec<processing::StepEntry>, f32, f32)> = ids
-                    .iter()
-                    .filter_map(|id| self.profiles.iter().find(|p| p.id == *id))
-                    .map(|p| (p.id, p.name.clone(), p.raw.clone(), p.steps.clone(), p.dx, p.freq_mhz))
-                    .collect();
-                if jobs.is_empty() {
-                    return;
-                }
-                let n = jobs.len();
-                let title = if n == 1 { format!("Processing {}", jobs[0].1) } else { format!("Processing {n} profiles") };
+                let mut ids = ids.into_iter();
+                let Some(id) = ids.next() else { return };
+                let rest: Vec<_> = ids.collect();
+                if !rest.is_empty() { self.task_queue.push_front(Pending::Process(rest)); }
+                let Some(p) = self.profiles.iter().find(|p| p.id == id) else { return };
+                let (name, raw, steps, dx, freq_mhz, gps, crs) = (p.name.clone(), p.raw.clone(), p.steps.clone(), p.dx, p.freq_mhz, p.gps.clone(), self.project_crs.clone());
+                let (topography, topography_error) = processing::topography_for_steps(p, &self.project_crs);
+                let title = format!("Processing {name}");
                 self.start_task(title, true, move |prog| {
-                    let mut out = Vec::new();
-                    for (k, (id, name, raw, steps, dx, f)) in jobs.into_iter().enumerate() {
-                        if prog.is_cancelled() {
-                            break;
-                        }
-                        prog.set_range(k as f32 / n as f32, (k + 1) as f32 / n as f32);
-                        let label = if n > 1 { format!("profile {}/{n}: {name}", k + 1) } else { name.clone() };
-                        prog.set_text(label.clone());
-                        let ctx = Ctx { dx, freq_mhz: f, progress: Some(prog.clone()), label };
-                        let (sec, log) = processing::run_all(&raw, &steps, &ctx);
-                        if prog.is_cancelled() {
-                            break;
-                        }
-                        out.push((id, sec, log));
-                    }
+                    prog.set_text(name.clone());
+                    let ctx = Ctx { dx, freq_mhz, progress: Some(prog.clone()), label: name, topography, topography_error };
+                    let (sec, log) = processing::run_all(&raw, &steps, &ctx);
                     prog.set(1.0);
-                    Output::Processed(out)
+                    Output::Processed(if prog.is_cancelled() { Vec::new() } else { vec![(id, sec, log, steps, dx, freq_mhz, gps, crs)] })
                 });
             }
             Pending::Import(files) => {
@@ -181,13 +167,27 @@ impl App {
     fn finish_task(&mut self, out: Output, secs: f32, cancelled: bool) {
         match out {
             Output::Processed(list) => {
+                if cancelled { self.task_queue.retain(|q| !matches!(q, Pending::Process(_))); }
                 let n = list.len();
-                for (id, sec, log) in list {
+                let mut applied = 0;
+                let mut errors = Vec::new();
+                for (id, sec, log, steps, dx, freq_mhz, gps, crs) in list {
                     if let Some(i) = self.profile_index(id) {
-                        self.apply_processed(i, sec, log);
+                        let p = &self.profiles[i];
+                        if p.steps == steps && p.dx.to_bits() == dx.to_bits() && p.freq_mhz.to_bits() == freq_mhz.to_bits() && p.gps == gps && self.project_crs == crs {
+                            self.apply_processed(i, sec, log);
+                            errors.extend(self.profiles[i].log.iter().cloned());
+                            applied += 1;
+                        }
                     }
                 }
-                self.status = if cancelled { format!("Processing cancelled ({n} profile(s) finished).") } else { format!("Processing finished: {n} profile(s) in {secs:.1} s.") };
+                if cancelled {
+                    self.status = format!("Processing cancelled ({applied} profile(s) finished).");
+                } else if errors.is_empty() {
+                    self.status = format!("Processing finished: {applied}/{n} profile(s) in {secs:.1} s.");
+                } else {
+                    self.status = errors.join("; ");
+                }
             }
             Output::Imported(profiles, errors) => {
                 let n = profiles.len();
@@ -265,5 +265,69 @@ impl App {
         if cancel {
             t.progress.cancel();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::processing::{Step, StepEntry};
+
+    #[test]
+    fn stale_processing_result_is_discarded() {
+        let mut app = App::headless(vec![], None);
+        let id = app.add_profile(Profile::new("test".into(), PathBuf::new(), "test", Section::new(2, 2, 1.0), 0.05));
+        let old = vec![StepEntry { enabled: true, step: Step::Dewow { window_ns: 3.0 } }];
+        app.profiles[0].steps = vec![StepEntry { enabled: true, step: Step::Dewow { window_ns: 4.0 } }];
+        let mut stale = Section::new(2, 2, 1.0);
+        stale.data.fill(99.0);
+        app.finish_task(Output::Processed(vec![(id, stale, vec![], old, 0.05, 0.0, None, app.project_crs.clone())]), 0.0, false);
+        assert_eq!(app.profiles[0].proc.data, vec![0.0; 4]);
+    }
+
+    #[test]
+    fn changed_gps_discards_background_migration_result() {
+        let mut app = App::headless(vec![], None);
+        let id = app.add_profile(Profile::new("test".into(), PathBuf::new(), "test", Section::new(2, 2, 1.0), 0.05));
+        let steps = app.profiles[0].steps.clone();
+        let mut stale = Section::new(2, 2, 1.0);
+        stale.data.fill(99.0);
+        app.profiles[0].gps = Some(crate::model::GpsTrack { source: "new GPS".into(), crs: app.project_crs.clone(), fixes: vec![] });
+        app.finish_task(Output::Processed(vec![(id, stale, vec![], steps, 0.05, 0.0, None, app.project_crs.clone())]), 0.0, false);
+        assert_eq!(app.profiles[0].proc.data, vec![0.0; 4]);
+    }
+
+    #[test]
+    fn cancelling_batch_drops_remaining_processing_requests() {
+        let mut app = App::headless(vec![], None);
+        app.task_queue.push_back(Pending::Process(vec![1, 2]));
+        app.task_queue.push_back(Pending::Import(vec![PathBuf::from("later.sgy")]));
+        app.finish_task(Output::Processed(vec![]), 0.0, true);
+        assert_eq!(app.task_queue.len(), 1);
+        assert!(matches!(app.task_queue.front(), Some(Pending::Import(_))));
+    }
+
+    #[test]
+    #[ignore]
+    fn synthetic_batch_memory() {
+        let mut app = App::headless(vec![], None);
+        let mut ids = Vec::new();
+        for k in 0..3 {
+            let mut raw = Section::new(1024, 2400, 0.25);
+            for (i, v) in raw.data.iter_mut().enumerate() { *v = ((i + k) as f32 * 0.01).sin(); }
+            let id = app.add_profile(Profile::new(format!("profile {k}"), PathBuf::new(), "test", raw, 0.05));
+            app.profiles[k].steps.push(StepEntry { enabled: true, step: Step::Dewow { window_ns: 5.0 } });
+            ids.push(id);
+        }
+        let ctx = egui::Context::default();
+        let start = Instant::now();
+        let mut first = None;
+        app.request_process(ids);
+        while app.busy() {
+            app.pump_tasks(&ctx);
+            if first.is_none() && app.profiles[0].version > 1 { first = Some(start.elapsed().as_secs_f64()); }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        println!("BATCH 3 profiles 2400x1024 first {:.3} s, all {:.3} s", first.unwrap_or_default(), start.elapsed().as_secs_f64());
     }
 }

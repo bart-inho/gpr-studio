@@ -15,12 +15,14 @@ pub struct Section {
     /// y value of the first sample (ns or m).
     pub t0: f32,
     pub depth_axis: bool,
+    /// For topographic migration only: elevation of depth zero (metres in project CRS).
+    pub depth_datum_m: Option<f64>,
     pub data: Vec<f32>,
 }
 
 impl Section {
     pub fn new(ns: usize, ntr: usize, dt: f32) -> Self {
-        Section { ns, ntr, dt, t0: 0.0, depth_axis: false, data: vec![0.0; ns * ntr] }
+        Section { ns, ntr, dt, t0: 0.0, depth_axis: false, depth_datum_m: None, data: vec![0.0; ns * ntr] }
     }
     pub fn trace(&self, i: usize) -> &[f32] {
         &self.data[i * self.ns..(i + 1) * self.ns]
@@ -47,16 +49,19 @@ impl Section {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GpsFix {
     /// Trace index (0-based, may be fractional).
     pub trace: f64,
     pub x: f64,
     pub y: f64,
     pub z: f64,
+    /// False for missing/implicit heights and older projects whose height provenance is unknown.
+    #[serde(default)]
+    pub has_elevation: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GpsTrack {
     pub source: String,
     pub crs: CrsSpec,
@@ -85,6 +90,8 @@ pub struct Profile {
     pub coords: Vec<[f64; 3]>,
     /// Per-trace distance along the profile (m).
     pub dist: Vec<f64>,
+    /// Horizontal GPS chainage, independent of the chosen display distance calibration.
+    pub horizontal_dist: Vec<f64>,
     pub use_gps_distance: bool,
     /// The trace spacing was read from the data file's header.
     pub dx_from_file: bool,
@@ -92,6 +99,8 @@ pub struct Profile {
     pub dx_user_set: bool,
     /// Show the section with topography (time zero follows the GPS elevation).
     pub show_topo: bool,
+    /// Show traces in reverse order without changing acquisition data or pick indices.
+    pub reverse_display: bool,
     pub log: Vec<String>,
     pub version: u64,
 }
@@ -110,6 +119,7 @@ impl Profile {
             dx_from_file: dx > 0.0 && dx.is_finite(),
             dx_user_set: false,
             show_topo: false,
+            reverse_display: false,
             freq_mhz: 0.0,
             velocity: 0.1,
             steps: Vec::new(),
@@ -118,6 +128,7 @@ impl Profile {
             embedded_gps: None,
             coords: Vec::new(),
             dist: Vec::new(),
+            horizontal_dist: Vec::new(),
             use_gps_distance: true,
             log: Vec::new(),
             version: 1,
@@ -128,6 +139,25 @@ impl Profile {
 
     pub fn has_coords(&self) -> bool {
         !self.coords.is_empty()
+    }
+
+    /// Orient the dominant track direction west-to-east or north-to-south.
+    pub fn auto_orientation(&self, project_crs: &CrsSpec) -> Option<bool> {
+        if self.coords.len() < 2 {
+            return None;
+        }
+        let mut ends = [self.coords[0], *self.coords.last()?];
+        crate::crs::transform_spec(project_crs, &CrsSpec::Epsg(4326), &mut ends).ok()?;
+        if ends.iter().any(|p| !p[0].is_finite() || !p[1].is_finite()) {
+            return None;
+        }
+        let lat = ((ends[0][1] + ends[1][1]) * 0.5).to_radians();
+        let east = (ends[1][0] - ends[0][0]) * lat.cos();
+        let north = ends[1][1] - ends[0][1];
+        if east.abs().max(north.abs()) < 1e-9 {
+            return None;
+        }
+        Some(if east.abs() >= north.abs() { east < 0.0 } else { north > 0.0 })
     }
 
     /// Recompute per-trace project coordinates from the GPS fixes.
@@ -166,7 +196,8 @@ impl Profile {
 
     pub fn update_distance(&mut self) {
         let n = self.proc.ntr.max(self.raw.ntr);
-        if self.use_gps_distance && self.coords.len() >= 2 && self.coords.len() == n {
+        self.horizontal_dist.clear();
+        if self.coords.len() >= 2 && self.coords.len() == n {
             let mut d = Vec::with_capacity(n);
             let mut acc = 0.0;
             d.push(0.0);
@@ -177,46 +208,118 @@ impl Profile {
                 d.push(acc);
             }
             // A degenerate track (no movement) falls back to the nominal spacing.
-            if acc > 0.0 {
-                self.dist = d;
-                return;
-            }
+            if acc.is_finite() && acc > 0.0 { self.horizontal_dist = d; }
+        }
+        if self.use_gps_distance && !self.horizontal_dist.is_empty() {
+            self.dist = self.horizontal_dist.clone();
+            return;
         }
         self.dist = (0..n).map(|i| i as f64 * self.dx as f64).collect();
+    }
+
+    pub fn topographic_geometry(&self, project_crs: &CrsSpec, max_gap_m: f32) -> Result<crate::processing::TopographicGeometry, String> {
+        let track = self.gps.as_ref().ok_or("Topographic Kirchhoff needs associated GPS positions with elevations.")?;
+        if self.raw.ntr < 2 || self.coords.len() != self.raw.ntr || self.horizontal_dist.len() != self.raw.ntr {
+            return Err("Topographic Kirchhoff needs valid positions for every trace.".into());
+        }
+        let crs = project_crs.build()?;
+        let units = project_crs.proj4().unwrap_or_default();
+        if crs.geographic || !units.split_whitespace().any(|s| s == "+units=m" || s == "+to_meter=1") {
+            return Err("Topographic Kirchhoff requires a projected coordinate system in metres (for example EPSG:2056).".into());
+        }
+        if !max_gap_m.is_finite() || max_gap_m <= 0.0 {
+            return Err("Maximum supported GPS gap must be positive metres.".into());
+        }
+        let mut fixes = track.fixes.clone();
+        fixes.sort_by(|a, b| a.trace.total_cmp(&b.trace));
+        if fixes.len() < 2 || fixes[0].trace > 0.0 || fixes.last().unwrap().trace < (self.raw.ntr - 1) as f64 {
+            return Err("GPS elevations must cover the first and last trace; extrapolation is not allowed.".into());
+        }
+        if fixes.iter().any(|f| !f.has_elevation || !f.trace.is_finite() || !f.x.is_finite() || !f.y.is_finite() || !f.z.is_finite()) {
+            return Err("GPS heights are missing or unverified. Re-associate a GPS file containing measured elevations.".into());
+        }
+        let mut pts: Vec<_> = fixes.iter().map(|f| [f.x, f.y, f.z]).collect();
+        crate::crs::transform_spec(&track.crs, project_crs, &mut pts)?;
+        for (i, pair) in fixes.windows(2).enumerate() {
+            let trace_gap = pair[1].trace - pair[0].trace;
+            let dx = pts[i + 1][0] - pts[i][0];
+            let dy = pts[i + 1][1] - pts[i][1];
+            let gap = dx.hypot(dy);
+            if trace_gap <= 0.0 || !gap.is_finite() || gap > max_gap_m as f64 {
+                return Err(format!("GPS gap exceeds {max_gap_m:.2} m or contains duplicate trace positions; add measured positions or increase the stated gap limit."));
+            }
+        }
+        if self.coords.iter().any(|c| c.iter().any(|v| !v.is_finite())) || self.horizontal_dist.windows(2).any(|w| !w[1].is_finite() || w[1] <= w[0]) {
+            return Err("GPS coordinates contain invalid or repeated trace positions.".into());
+        }
+        Ok(crate::processing::TopographicGeometry {
+            x_m: self.horizontal_dist.clone(),
+            elevation_m: self.coords.iter().map(|c| c[2]).collect(),
+        })
+    }
+
+    pub fn axis_distance(&self) -> &[f64] {
+        if self.proc.depth_datum_m.is_some() && !self.horizontal_dist.is_empty() { &self.horizontal_dist } else { &self.dist }
+    }
+
+    pub fn antenna_height_correction(&self) -> f64 {
+        self.steps.iter().find_map(|e| if e.enabled {
+            if let crate::processing::Step::TopographicKirchhoff { gps_above_antenna_m, .. } = &e.step { Some(*gps_above_antenna_m as f64) } else { None }
+        } else { None }).unwrap_or(0.0)
     }
 
     pub fn length(&self) -> f64 {
         self.dist.last().copied().unwrap_or(0.0)
     }
 
+    pub fn axis_length(&self) -> f64 {
+        self.axis_distance().last().copied().unwrap_or(0.0)
+    }
+
     pub fn dist_at(&self, trace: f32) -> f64 {
-        if self.dist.is_empty() {
+        self.distance_at(&self.dist, trace)
+    }
+
+    pub fn axis_dist_at(&self, trace: f32) -> f64 {
+        self.distance_at(self.axis_distance(), trace)
+    }
+
+    fn distance_at(&self, distances: &[f64], trace: f32) -> f64 {
+        if distances.is_empty() {
             return trace as f64 * self.dx as f64;
         }
-        let n = self.dist.len();
+        let n = distances.len();
         let t = trace.clamp(0.0, (n - 1) as f32);
         let i = t.floor() as usize;
         let f = (t - i as f32) as f64;
         if i + 1 < n {
-            self.dist[i] * (1.0 - f) + self.dist[i + 1] * f
+            distances[i] * (1.0 - f) + distances[i + 1] * f
         } else {
-            self.dist[n - 1]
+            distances[n - 1]
         }
     }
 
     pub fn trace_at_dist(&self, d: f64) -> f32 {
-        if self.dist.len() < 2 {
+        self.trace_at_distance(&self.dist, d)
+    }
+
+    pub fn axis_trace_at_dist(&self, d: f64) -> f32 {
+        self.trace_at_distance(self.axis_distance(), d)
+    }
+
+    fn trace_at_distance(&self, distances: &[f64], d: f64) -> f32 {
+        if distances.len() < 2 {
             return (d / self.dx as f64) as f32;
         }
-        let idx = self.dist.partition_point(|v| *v < d);
+        let idx = distances.partition_point(|v| *v < d);
         if idx == 0 {
             return 0.0;
         }
-        if idx >= self.dist.len() {
-            return (self.dist.len() - 1) as f32;
+        if idx >= distances.len() {
+            return (distances.len() - 1) as f32;
         }
-        let a = self.dist[idx - 1];
-        let b = self.dist[idx];
+        let a = distances[idx - 1];
+        let b = distances[idx];
         let f = if b > a { (d - a) / (b - a) } else { 0.0 };
         (idx - 1) as f32 + f as f32
     }
@@ -397,4 +500,44 @@ pub fn short_label(name: &str) -> String {
         start -= 1;
     }
     chars[start..end].iter().collect()
+}
+
+#[cfg(test)]
+mod orientation_tests {
+    use super::*;
+
+    #[test]
+    fn orients_by_dominant_compass_direction() {
+        let mut p = Profile::new("test".into(), PathBuf::new(), "test", Section::new(1, 2, 1.0), 1.0);
+        let crs = CrsSpec::Epsg(4326);
+        p.coords = vec![[8.0, 47.0, 0.0], [7.99, 47.001, 0.0]];
+        assert_eq!(p.auto_orientation(&crs), Some(true)); // westbound
+        p.coords[1] = [8.01, 47.001, 0.0];
+        assert_eq!(p.auto_orientation(&crs), Some(false)); // eastbound
+        p.coords[1] = [8.001, 47.01, 0.0];
+        assert_eq!(p.auto_orientation(&crs), Some(true)); // northbound
+        p.coords[1] = [8.001, 46.99, 0.0];
+        assert_eq!(p.auto_orientation(&crs), Some(false)); // southbound
+        p.coords[1] = p.coords[0];
+        assert_eq!(p.auto_orientation(&crs), None);
+    }
+
+    #[test]
+    fn topographic_geometry_requires_measured_height_coverage_and_horizontal_spacing() {
+        let crs = CrsSpec::Epsg(2056);
+        let mut p = Profile::new("test".into(), PathBuf::new(), "test", Section::new(10, 5, 0.2), 0.5);
+        p.use_gps_distance = false;
+        p.gps = Some(GpsTrack { source: "measured".into(), crs: crs.clone(), fixes: (0..5).map(|i| GpsFix { trace: i as f64, x: 2_600_000.0 + i as f64, y: 1_200_000.0, z: 500.0 + i as f64 * 0.1, has_elevation: true }).collect() });
+        p.update_coords(&crs);
+        let g = p.topographic_geometry(&crs, 1.1).unwrap();
+        assert_eq!(g.x_m, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(p.dist_at(4.0), 2.0); // Display calibration remains nominal.
+        p.gps.as_mut().unwrap().fixes[2].has_elevation = false;
+        assert!(p.topographic_geometry(&crs, 1.1).is_err());
+        p.gps.as_mut().unwrap().fixes[2].has_elevation = true;
+        p.gps.as_mut().unwrap().fixes.remove(2);
+        assert!(p.topographic_geometry(&crs, 1.1).is_err()); // Unsupported 2 m GPS gap.
+        p.gps.as_mut().unwrap().fixes.remove(0);
+        assert!(p.topographic_geometry(&crs, 3.0).is_err()); // No first-trace elevation.
+    }
 }

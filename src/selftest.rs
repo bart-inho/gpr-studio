@@ -98,14 +98,14 @@ pub fn run(out: PathBuf, files: Vec<PathBuf>) -> i32 {
     app.wait_jobs();
     println!("basemaps in app: {}", app.basemaps.len());
     let p = &app.profiles[0];
-    let ctx = Ctx { dx: p.dx, freq_mhz: p.freq_mhz, ..Default::default() };
+    let ctx = Ctx { dx: p.dx, freq_mhz: p.freq_mhz, topography: p.topographic_geometry(&app.project_crs, 2.0).ok().map(std::sync::Arc::new), ..Default::default() };
     for s in Step::defaults() {
         let t = std::time::Instant::now();
         let input = if matches!(s, Step::TimeZero { .. }) { &p.raw } else { &p.proc };
         match s.apply(input, &ctx) {
             Ok(o) => {
-                let bad = o.data.iter().any(|v| !v.is_finite());
-                let m = o.data.iter().fold(0f32, |a, v| a.max(v.abs()));
+                let bad = o.data.iter().any(|v| v.is_infinite()) || (o.depth_datum_m.is_none() && o.data.iter().any(|v| v.is_nan()));
+                let m = o.data.iter().filter(|v| v.is_finite()).fold(0f32, |a, v| a.max(v.abs()));
                 println!("STEP {:<28} ok  {:>4} x {:<4} max|a| {:>10.2}  {:>6} ms{}", s.name(), o.ntr, o.ns, m, t.elapsed().as_millis(), if bad { "  NON-FINITE!" } else { "" });
                 if bad {
                     fails += 1;
@@ -190,6 +190,8 @@ pub fn run(out: PathBuf, files: Vec<PathBuf>) -> i32 {
             },
             reload: None,
             raw: Some(p.raw.clone()),
+            topography: None,
+            topography_error: None,
             steps: p.steps.clone(),
             stages: vec![0, 2, 4],
             out_dir: out.clone(),
@@ -251,8 +253,9 @@ pub fn run(out: PathBuf, files: Vec<PathBuf>) -> i32 {
     // Exports
     let g = out.join("selftest.gpkg");
     app.gpkg_opts.trace_points = true;
+    let export_started = std::time::Instant::now();
     match app.export_gpkg(&g) {
-        Ok(s) => println!("GPKG OK {} ({s})", g.display()),
+        Ok(s) => println!("GPKG OK {} ({s}) in {:.3} s", g.display(), export_started.elapsed().as_secs_f64()),
         Err(e) => {
             println!("GPKG FAIL {e}");
             fails += 1;
@@ -263,16 +266,18 @@ pub fn run(out: PathBuf, files: Vec<PathBuf>) -> i32 {
     app.pdf_opts.chunk_m = 15.0;
     app.pdf_opts.title = "Self test".into();
     let pdfp = out.join("selftest.pdf");
+    let export_started = std::time::Instant::now();
     match crate::report::export(&app, &pdfp) {
-        Ok(n) => println!("PDF OK {} ({n} pages)", pdfp.display()),
+        Ok(n) => println!("PDF OK {} ({n} pages) in {:.3} s", pdfp.display(), export_started.elapsed().as_secs_f64()),
         Err(e) => {
             println!("PDF FAIL {e}");
             fails += 1;
         }
     }
     let csv = out.join("selftest.csv");
+    let export_started = std::time::Instant::now();
     match app.export_csv(&csv) {
-        Ok(n) => println!("CSV OK {} ({n} picks)", csv.display()),
+        Ok(n) => println!("CSV OK {} ({n} picks) in {:.3} s", csv.display(), export_started.elapsed().as_secs_f64()),
         Err(e) => {
             println!("CSV FAIL {e}");
             fails += 1;
@@ -280,8 +285,9 @@ pub fn run(out: PathBuf, files: Vec<PathBuf>) -> i32 {
     }
     // Basemaps given as files
     for f in files.iter().filter(|f| f.extension().map(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff")).unwrap_or(false)) {
+        let load_started = std::time::Instant::now();
         match crate::basemap::load(f, &|_| {}) {
-            Ok(l) => println!("BASEMAP OK {}: {}x{} overview {}x{} crs {:?} geo {:?}", f.display(), l.info.width, l.info.height, l.overview.w, l.overview.h, l.info.crs, l.info.geo),
+            Ok(l) => println!("BASEMAP OK {}: {}x{} overview {}x{} crs {:?} geo {:?} in {:.3} s", f.display(), l.info.width, l.info.height, l.overview.w, l.overview.h, l.info.crs, l.info.geo, load_started.elapsed().as_secs_f64()),
             Err(e) => {
                 println!("BASEMAP FAIL {}: {e}", f.display());
                 fails += 1;

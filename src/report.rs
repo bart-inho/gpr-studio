@@ -75,19 +75,20 @@ fn ranges(app: &App, p: &Profile) -> Vec<(f32, f32)> {
         }
         PdfRange::Whole => vec![(0.0, n)],
         PdfRange::Chunks => {
-            let len = p.length().max(1e-6);
+            let len = p.axis_length().max(1e-6);
             let step = app.pdf_opts.chunk_m.max(0.5) as f64;
             let mut out = Vec::new();
             let mut d = 0.0;
             while d < len - 1e-6 {
-                let a = p.trace_at_dist(d);
-                let b = p.trace_at_dist((d + step).min(len)) + 1.0;
+                let a = p.axis_trace_at_dist(d);
+                let b = p.axis_trace_at_dist((d + step).min(len)) + 1.0;
                 out.push((a, b.min(n)));
                 d += step;
             }
             if out.is_empty() {
                 out.push((0.0, n));
             }
+            if p.reverse_display { out.reverse(); }
             out
         }
     }
@@ -192,7 +193,7 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
         pg.fill_color([255, 255, 255]);
         let title = if app.pdf_opts.title.trim().is_empty() { "GPR profile report".to_string() } else { app.pdf_opts.title.clone() };
         pg.text(m, 20.0 * k, 13.0 * k, &title, true);
-        pg.text(m + crate::pdf::text_width(&title, 13.0 * k) + 14.0, 20.0 * k, 11.0 * k, &format!("Profile {}  ·  {:.1} - {:.1} m", p.name, p.dist_at(tr0), p.dist_at((tr1 - 1.0).max(tr0))), false);
+        pg.text(m + crate::pdf::text_width(&title, 13.0 * k) + 14.0, 20.0 * k, 11.0 * k, &format!("Profile {}  ·  {:.1} - {:.1} m", p.name, p.axis_dist_at(tr0), p.axis_dist_at((tr1 - 1.0).max(tr0))), false);
         pg.text_right(pw - m, 20.0 * k, 9.0 * k, &format!("{}  ·  {}  ·  page {}/{}", date, app.project_crs.short(), pi + 1, total), false);
 
         // ---------------------------------------------------------- radargram
@@ -203,8 +204,8 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
         // Horizontal scale. "One page every N m": N metres always fill the frame, so every page and
         // every profile has the same scale and a shorter last part leaves the rest of the frame blank.
         let ntr_page = (tr1 - tr0).max(1.0);
-        let d_first = p.dist_at(tr0);
-        let d_last = p.dist_at((tr1 - 1.0).max(tr0));
+        let d_first = p.axis_dist_at(tr0);
+        let d_last = p.axis_dist_at((tr1 - 1.0).max(tr0));
         let dx_avg = if ntr_page > 1.0 { ((d_last - d_first) / (ntr_page as f64 - 1.0)).max(1e-9) } else { p.dx as f64 };
         let page_len = ntr_page as f64 * dx_avg; // metres covered by the traces of this page
         let span_m = if app.pdf_opts.range == PdfRange::Chunks { (app.pdf_opts.chunk_m as f64).max(page_len.min(app.pdf_opts.chunk_m as f64 * 1.05)) } else { page_len };
@@ -216,7 +217,14 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
         let view = app.views.get(&p.id);
         let (s0, s1) = view.map(|v| (v.s0, v.s1)).unwrap_or((0.0, p.proc.ns as f32));
         let rgba = crate::render::render(&p.proc, tr0, tr1, s0, s1, iw, ih, app.colormap, clip);
-        let rgb: Vec<u8> = rgba.chunks(4).flat_map(|c| [c[0], c[1], c[2]]).collect();
+        let mut rgb = Vec::with_capacity(iw * ih * 3);
+        for row in rgba.chunks_exact(iw * 4) {
+            if p.reverse_display {
+                for c in row.chunks_exact(4).rev() { rgb.extend_from_slice(&c[..3]); }
+            } else {
+                for c in row.chunks_exact(4) { rgb.extend_from_slice(&c[..3]); }
+            }
+        }
         let img = pdf.add_image(iw, ih, &rgb);
         pg.image(img, gx, gy, gw, gh);
         pg.stroke_color([0, 0, 0]);
@@ -234,7 +242,10 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
             pg.stroke_color([0, 0, 0]);
             pg.line_width(0.8);
         }
-        let x_of = |tr: f32| gx + (tr + 0.5 - tr0) / (tr1 - tr0) * gw;
+        let x_of = |tr: f32| {
+            let x = (tr + 0.5 - tr0) / (tr1 - tr0);
+            gx + (if p.reverse_display { 1.0 - x } else { x }) * gw
+        };
         let y_of = |s: f32| gy + (s + 0.5 - s0) / (s1 - s0) * gh;
         let depth_sec = p.proc.depth_axis;
         // Axes: left time (or depth), right depth, bottom distance.
@@ -251,7 +262,19 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
             pg.text_right(gx - 6.0, y + 2.5, fs, &fmt_tick(v, step), false);
             v += step;
         }
-        pg.text_rotated(m + 6.0 * k, gy + gh / 2.0 + 25.0, fs, if depth_sec { "depth [m]" } else { "time [ns]" });
+        pg.text_rotated(m + 6.0 * k, gy + gh / 2.0 + 25.0, fs, if p.proc.depth_datum_m.is_some() { "depth below datum [m]" } else if depth_sec { "depth [m]" } else { "time [ns]" });
+        if let Some(datum) = p.proc.depth_datum_m {
+            let (ea, eb) = (datum - yv_bot as f64, datum - yv_top as f64);
+            let estep = nice_step(eb - ea, 6.0);
+            let mut e = (ea / estep).ceil() * estep;
+            while e <= eb + 1e-9 {
+                let y = y_of(p.proc.sample_of((datum - e) as f32));
+                pg.line([gx + gw_full, y], [gx + gw_full + 4.0, y]);
+                pg.text(gx + gw_full + 6.0, y + 2.5, fs, &fmt_tick(e, estep), false);
+                e += estep;
+            }
+            pg.text_rotated(pw - m - 2.0, gy + gh / 2.0 + 40.0, fs, "elevation [m]");
+        }
         if !depth_sec {
             let (da, db) = (p.depth_of_time(la), p.depth_of_time(lb));
             let step = nice_step((db - da) as f64, 6.0);
@@ -265,13 +288,15 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
             pg.text_rotated(pw - m - 2.0, gy + gh / 2.0 + 40.0, fs, &format!("depth [m] (v={:.3} m/ns)", p.velocity));
         }
         // Distance ticks at the page's fixed scale, across the whole frame (also over the blank part).
-        let d0 = d_first;
-        let d1 = d_first + span_m - dx_avg * 0.5;
+        let axis_first = if p.reverse_display { p.axis_length() - d_last } else { d_first };
+        let axis_last = if p.reverse_display { p.axis_length() - d_first } else { d_last };
+        let d0 = axis_first;
+        let d1 = axis_first + span_m - dx_avg * 0.5;
         let step = nice_step(span_m, 10.0);
-        let x_lin = |d: f64| gx + ((d - d_first + dx_avg * 0.5) * scale) as f32;
+        let x_lin = |d: f64| gx + ((d - axis_first + dx_avg * 0.5) * scale) as f32;
         let mut d = (d0 / step).ceil() * step;
         while d <= d1 + 1e-9 {
-            let x = if d <= d_last { x_of(p.trace_at_dist(d)) } else { x_lin(d) };
+            let x = if d <= axis_last { x_of(p.axis_trace_at_dist(if p.reverse_display { p.axis_length() - d } else { d })) } else { x_lin(d) };
             if x <= gx + gw_full + 0.5 {
                 pg.line([x, gy + gh], [x, gy + gh + 4.0]);
                 pg.text_center(x, gy + gh + 12.0, fs, &fmt_tick(d, step), false);
@@ -281,7 +306,7 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
         let scale_note = if app.pdf_opts.range == PdfRange::Chunks { format!("distance [m]  ·  {:.0} m per page width", span_m) } else { "distance [m]".to_string() };
         pg.text_center(gx + gw_full / 2.0, gy + gh + 22.0 * k, fs, &scale_note, false);
         // Picks on the radargram
-        if app.pdf_opts.markers {
+        if app.pdf_opts.markers && p.proc.depth_datum_m.is_none() {
             pg.save();
             pg.clip_rect(gx, gy, gw, gh);
             let sample_of_t = |t: f32| p.proc.sample_of(if depth_sec { p.depth_of_time(t) } else { t });
@@ -476,19 +501,23 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
         iy += lh * 1.2;
         let sec_a = p.coord_at(tr0);
         let sec_b = p.coord_at((tr1 - 1.0).max(tr0));
-        let rows: Vec<(&str, String)> = vec![
+        let mut rows: Vec<(&str, String)> = vec![
             ("File", p.path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string()),
             ("Format", p.format.clone()),
             ("Traces / samples", format!("{} / {}", p.raw.ntr, p.raw.ns)),
             ("Sample interval", format!("{:.4} ns  (window {:.1} ns)", p.raw.dt, p.raw.dt * p.raw.ns as f32)),
             ("Antenna", if p.freq_mhz > 0.0 { format!("{:.0} MHz", p.freq_mhz) } else { "-".into() }),
             ("Velocity", format!("{:.4} m/ns  (eps {:.1})", p.velocity, (0.2998 / p.velocity).powi(2))),
-            ("Profile length", format!("{:.2} m", p.length())),
-            ("This section", format!("{:.2} - {:.2} m (traces {:.0}-{:.0})", p.dist_at(tr0), p.dist_at((tr1 - 1.0).max(tr0)), tr0 + 1.0, tr1)),
+            ("Profile length", format!("{:.2} m", p.axis_length())),
+            ("This section", format!("{:.2} - {:.2} m (traces {:.0}-{:.0})", p.axis_dist_at(tr0), p.axis_dist_at((tr1 - 1.0).max(tr0)), tr0 + 1.0, tr1)),
             ("Section start", sec_a.map(|c| format!("E {:.2}  N {:.2}", c[0], c[1])).unwrap_or("-".into())),
             ("Section end", sec_b.map(|c| format!("E {:.2}  N {:.2}", c[0], c[1])).unwrap_or("-".into())),
             ("GPS", p.gps.as_ref().map(|g| g.source.clone()).unwrap_or("none".into())),
         ];
+        if let Some(datum) = p.proc.depth_datum_m {
+            rows.push(("Depth datum", format!("{datum:.3} m elevation")));
+            rows.push(("Picks", "Acquisition-time picks hidden on migrated grid".into()));
+        }
         for (k2, v2) in rows {
             pg.fill_color([90, 90, 90]);
             pg.text(ix, iy, ifs, k2, false);

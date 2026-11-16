@@ -14,18 +14,29 @@ picking, mapping and reporting. Written in Rust with egui; runs on Windows, macO
 - **Processing** – set time zero, dewow, DC shift, background removal, bandpass (FFT and Butterworth),
   AGC (optionally with the gain smoothed over neighbouring traces), energy decay, gain function,
   divergence compensation, trace normalisation, running (moving) average over traces, average xy-filter,
-  diffraction stack, Kirchhoff and FK (Stolt) migration, time-depth conversion. Runs in the background
+  diffraction stack, flat and topographic Kirchhoff migration, FK (Stolt) migration, time-depth conversion. Runs in the background
   with a progress bar; sequences can be applied to all profiles.
 - **Data view** – distance in metres from the file's trace spacing (or GPS); "Show topography" lets time
-  zero follow the GPS elevation (velocity from the toolbar) with an elevation axis. Wheel / side wheel slide
-  along the profile, Shift + wheel crops the time axis from 0, Ctrl + wheel zooms horizontally (short profiles
-  are drawn narrower at the same scale, never stretched).
+  zero follow the GPS elevation (velocity from the toolbar) with an elevation axis. The main wheel scrolls
+  vertically; the side wheel slides along the profile. Shift + wheel crops the time axis from 0,
+  Ctrl + wheel zooms horizontally (short profiles are drawn narrower at the same scale, never stretched).
+  **Orient profiles**, next to Fit, uses GPS to display each profile west-to-east or north-to-south
+  along its dominant direction. Source traces and pick indices remain in acquisition order; the
+  display direction is saved in the project.
 - **Picking** – typed point markers, hyperbola velocity fitting, layer lines with phase following and snapping.
 - **Export** – GeoPackage (profiles, markers, layer picks, trace points), SEG-Y of chosen processing steps,
   PDF report (radargram + map with the same section highlighted), CSV of picks.
 - **Projects** – `.gprproj` files keep the file list, processing, GPS, picks, CRS and basemaps.
   Ctrl+S saves to the project's file, File › Open last project reopens the previous one, and closing only
   asks to save when something changed.
+
+## Topographic Kirchhoff migration
+
+Associate GPS with measured elevations, choose a projected CRS in metres, then add **Topo Kirchhoff** to the processing sequence. Set the constant velocity, summation width, maximum measured GPS gap, and the vertical offset from antenna to GPS receiver (positive when the GPS is above the antenna). A zero offset means the GPS height is already the antenna height. This operation uses the unshifted time data at that point in the sequence. Keep it as the last step; further time-based processing is not applicable to its depth output. The ordinary Kirchhoff and FK steps retain their flat-surface assumptions.
+
+The output vertical axis is **depth below the highest antenna elevation**; the right axis shows elevation. The horizontal axis uses horizontal GPS distance even if the ordinary profile display uses a nominal trace spacing. Blank space above the local surface is stored as no data. **Show topography** is display-only and is ignored for this migrated result. Existing picks remain in acquisition time and are hidden on the migrated radargram and PDF; disable the migration step to view or edit them. Pick CSV/GeoPackage exports retain the original time and local-depth meaning. SEG-Y includes the datum in its text header, corrected antenna elevations in trace headers, and IEEE NaN above the local surface.
+
+Full first-to-last trace coverage and finite, increasing positions are required. GPS gaps larger than the stated limit cause an error. Older project GPS entries without verified height provenance need to be re-associated with the original GPS file. See [MECHANICS.md](MECHANICS.md) for the equation, assumptions, and references.
 
 ## Build
 

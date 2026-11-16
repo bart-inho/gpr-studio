@@ -452,7 +452,7 @@ pub fn read_segy(path: &Path, opt: &ImportOptions) -> Result<Profile, String> {
         let z = be32(&b, th + 40, le) as f64 * esc;
         coord_units = be16(&b, th + 88, le);
         if x != 0.0 || y != 0.0 {
-            fixes.push(GpsFix { trace: t as f64, x, y, z });
+            fixes.push(GpsFix { trace: t as f64, x, y, z, has_elevation: be32(&b, th + 40, le) != 0 });
         }
     }
     let mut p = Profile::new(stem_name(path), path.to_path_buf(), "SEG-Y", sec, 0.0);

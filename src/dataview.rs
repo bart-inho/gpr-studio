@@ -8,6 +8,7 @@ use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke};
 
 struct Frame {
     plot: Rect,
+    reversed: bool,
     tr0: f32,
     tr1: f32,
     s0: f32,
@@ -16,16 +17,33 @@ struct Frame {
 
 impl Frame {
     fn x_of_trace(&self, tr: f32) -> f32 {
-        self.plot.left() + (tr + 0.5 - self.tr0) / (self.tr1 - self.tr0) * self.plot.width()
+        let x = (tr + 0.5 - self.tr0) / (self.tr1 - self.tr0);
+        self.plot.left() + (if self.reversed { 1.0 - x } else { x }) * self.plot.width()
     }
     fn trace_of_x(&self, x: f32) -> f32 {
-        self.tr0 + (x - self.plot.left()) / self.plot.width() * (self.tr1 - self.tr0) - 0.5
+        let x = (x - self.plot.left()) / self.plot.width();
+        self.tr0 + (if self.reversed { 1.0 - x } else { x }) * (self.tr1 - self.tr0) - 0.5
     }
     fn y_of_sample(&self, s: f32) -> f32 {
         self.plot.top() + (s + 0.5 - self.s0) / (self.s1 - self.s0) * self.plot.height()
     }
     fn sample_of_y(&self, y: f32) -> f32 {
         self.s0 + (y - self.plot.top()) / self.plot.height() * (self.s1 - self.s0) - 0.5
+    }
+}
+
+#[cfg(test)]
+mod orientation_tests {
+    use super::*;
+
+    #[test]
+    fn reversed_frame_keeps_picks_on_their_traces() {
+        let plot = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(100.0, 100.0));
+        let normal = Frame { plot, reversed: false, tr0: 0.0, tr1: 10.0, s0: 0.0, s1: 10.0 };
+        let reversed = Frame { reversed: true, ..normal };
+        assert!(normal.x_of_trace(2.0) < normal.x_of_trace(7.0));
+        assert!(reversed.x_of_trace(2.0) > reversed.x_of_trace(7.0));
+        assert!((reversed.trace_of_x(reversed.x_of_trace(2.0)) - 2.0).abs() < 1e-5);
     }
 }
 
@@ -50,17 +68,19 @@ impl App {
             return;
         };
         let pid = self.profiles[a].id;
+        let reversed = self.profiles[a].reverse_display;
         // Topography: per-trace shift (display samples) and the shifted section to draw.
-        let topo = self.profiles[a].topo_shifts();
+        let migrated = self.profiles[a].proc.depth_datum_m.is_some();
+        let topo = if migrated { None } else { self.profiles[a].topo_shifts() };
         let sh: Vec<f32> = topo.as_ref().map(|t| t.1.clone()).unwrap_or_default();
-        let zmax = topo.as_ref().map(|t| t.0);
+        let zmax = self.profiles[a].proc.depth_datum_m.or_else(|| topo.as_ref().map(|t| t.0));
         let max_shift = sh.iter().fold(0f32, |m, v| m.max(*v)).ceil() as usize;
         if topo.is_some() {
             let p = &self.profiles[a];
             let key = format!("{}-{}-{:.5}-{}", p.id, p.version, p.velocity, p.coords.len());
             if self.topo_cache.as_ref().map(|c| c.0 != key).unwrap_or(true) {
                 let s = &p.proc;
-                let mut d = crate::model::Section { ns: s.ns + max_shift, ntr: s.ntr, dt: s.dt, t0: s.t0, depth_axis: s.depth_axis, data: vec![f32::NAN; (s.ns + max_shift) * s.ntr] };
+                let mut d = crate::model::Section { ns: s.ns + max_shift, ntr: s.ntr, dt: s.dt, t0: s.t0, depth_axis: s.depth_axis, depth_datum_m: s.depth_datum_m, data: vec![f32::NAN; (s.ns + max_shift) * s.ntr] };
                 for t in 0..s.ntr {
                     let k = sh[t].round().max(0.0) as usize;
                     let ns2 = d.ns;
@@ -91,7 +111,7 @@ impl App {
                     p.proc.ns,
                     p.proc.dt,
                     if p.proc.depth_axis { "m" } else { "ns" },
-                    p.length(),
+                    p.axis_length(),
                     if p.has_coords() { " · GPS" } else { " · no GPS" }
                 ));
                 let ed = p.steps.iter().filter(|e| e.enabled).count();
@@ -99,6 +119,9 @@ impl App {
                     ui.weak(format!("· {ed} processing steps"));
                 }
             });
+        }
+        if migrated {
+            ui.label("Topographic migration: depth below highest antenna. Acquisition-time picks are hidden; disable this step to edit them.");
         }
 
         let avail = ui.available_rect_before_wrap();
@@ -118,13 +141,13 @@ impl App {
         let hover_pos = resp.hover_pos();
         let (scroll, zoom, mods) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers));
         if let Some(hp) = hover_pos {
-            let fr = Frame { plot, tr0: view.tr0, tr1: view.tr1, s0: view.s0, s1: view.s1 };
+            let fr = Frame { plot, reversed, tr0: view.tr0, tr1: view.tr1, s0: view.s0, s1: view.s1 };
             let ct = fr.trace_of_x(hp.x) + 0.5;
             let cs = fr.sample_of_y(hp.y) + 0.5;
             let mut fx = 1.0f32;
             let mut fy = 1.0f32;
-            // Wheel: Shift = time axis from 0 down to x; Ctrl (or Ctrl+Shift) = horizontal zoom;
-            // plain wheel and side wheel = slide along the profile.
+            // Shift + wheel crops the time axis; Ctrl + wheel zooms horizontally.
+            // Otherwise the main wheel scrolls vertically and the side wheel horizontally.
             let ctrl = mods.ctrl || mods.command;
             let wheel = scroll.x + scroll.y; // Shift turns the wheel into a horizontal scroll
             if ctrl {
@@ -139,10 +162,13 @@ impl App {
                     view.s0 = 0.0;
                     view.s1 = (view.s1 * (-wheel * 0.0025).exp()).clamp(4.0, ns.max(4.0));
                 }
-            } else if wheel != 0.0 {
-                let d = -wheel / plot.width() * (view.tr1 - view.tr0);
-                view.tr0 += d;
-                view.tr1 += d;
+            } else {
+                let dtr = (if reversed { scroll.x } else { -scroll.x }) / plot.width() * (view.tr1 - view.tr0);
+                let ds = -scroll.y / plot.height() * (view.s1 - view.s0);
+                view.tr0 += dtr;
+                view.tr1 += dtr;
+                view.s0 += ds;
+                view.s1 += ds;
             }
             if fx != 1.0 {
                 view.tr0 = ct - (ct - view.tr0) * fx;
@@ -157,7 +183,7 @@ impl App {
         let pan_drag = (resp.dragged_by(egui::PointerButton::Secondary) && !selecting) || resp.dragged_by(egui::PointerButton::Middle) || (self.mode == PickMode::Navigate && resp.dragged_by(egui::PointerButton::Primary)) || (self.mode == PickMode::Layer && resp.dragged_by(egui::PointerButton::Primary));
         if pan_drag {
             let d = resp.drag_delta();
-            let dtr = -d.x / plot.width() * (view.tr1 - view.tr0);
+            let dtr = (if reversed { d.x } else { -d.x }) / plot.width() * (view.tr1 - view.tr0);
             let ds = -d.y / plot.height() * (view.s1 - view.s0);
             view.tr0 += dtr;
             view.tr1 += dtr;
@@ -195,7 +221,7 @@ impl App {
             (plot, view)
         };
         let _ = full_plot;
-        let fr = Frame { plot, tr0: view.tr0, tr1: view.tr1, s0: view.s0, s1: view.s1 };
+        let fr = Frame { plot, reversed, tr0: view.tr0, tr1: view.tr1, s0: view.s0, s1: view.s1 };
 
         // ---------------------------------------------------------- image
         let p = &self.profiles[a];
@@ -217,7 +243,8 @@ impl App {
         let painter = ui.painter_at(avail);
         painter.rect_filled(plot.expand(1.0), 0.0, Color32::from_gray(72));
         if let Some(t) = &self.section_tex {
-            painter.image(t.id(), plot, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            let uv = if reversed { Rect::from_min_max(Pos2::new(1.0, 0.0), Pos2::new(0.0, 1.0)) } else { Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)) };
+            painter.image(t.id(), plot, uv, Color32::WHITE);
         }
         let p = &self.profiles[a];
         let plot_painter = ui.painter_at(plot);
@@ -257,7 +284,7 @@ impl App {
                 }
                 v += step;
             }
-            let label = if is_depth { format!("depth [m] (v={:.3})", p.velocity) } else if zmax.is_some() { "time [ns] below the highest point".to_string() } else { "time [ns]".to_string() };
+            let label = if migrated { "depth below datum [m]".to_string() } else if is_depth { format!("depth [m] (v={:.3})", p.velocity) } else if zmax.is_some() { "time [ns] below the highest point".to_string() } else { "time [ns]".to_string() };
             let lx = if at_left { avail.left() + 2.0 } else { plot.right() + right - 12.0 };
             let galley = painter.layout_no_wrap(label, font.clone(), axis_col);
             let pos = Pos2::new(lx, plot.center().y + galley.size().x / 2.0);
@@ -278,36 +305,36 @@ impl App {
                 }
                 e += step;
             }
-            let galley = painter.layout_no_wrap(format!("elevation [m] (v={:.3})", p.velocity), font.clone(), axis_col);
+            let galley = painter.layout_no_wrap(if migrated { "elevation [m]".to_string() } else { format!("elevation [m] (v={:.3})", p.velocity) }, font.clone(), axis_col);
             let pos = Pos2::new(plot.right() + right - 12.0, plot.center().y + galley.size().x / 2.0);
             painter.add(egui::epaint::TextShape::new(pos, galley, axis_col).with_angle(-std::f32::consts::FRAC_PI_2));
         } else {
             draw_y_axis(!primary_depth, false);
         }
         // Distance axis (bottom)
-        let d0 = p.dist_at(view.tr0.max(0.0));
-        let d1 = p.dist_at(view.tr1.min(ntr - 1.0));
+        let d0 = if reversed { p.axis_length() - p.axis_dist_at(view.tr1.min(ntr - 1.0)) } else { p.axis_dist_at(view.tr0.max(0.0)) };
+        let d1 = if reversed { p.axis_length() - p.axis_dist_at(view.tr0.max(0.0)) } else { p.axis_dist_at(view.tr1.min(ntr - 1.0)) };
         let step = nice_step(d1 - d0, (plot.width() / 80.0) as f64);
         let mut d = (d0 / step).ceil() * step;
         while d <= d1 + 1e-9 {
-            let tr = p.trace_at_dist(d);
+            let tr = p.axis_trace_at_dist(if reversed { p.axis_length() - d } else { d });
             let x = fr.x_of_trace(tr);
             painter.line_segment([Pos2::new(x, plot.bottom()), Pos2::new(x, plot.bottom() + 5.0)], Stroke::new(1.0, axis_col));
             painter.text(Pos2::new(x, plot.bottom() + 7.0), Align2::CENTER_TOP, fmt_tick(d, step), font.clone(), axis_col);
             d += step;
         }
-        painter.text(Pos2::new(plot.center().x, plot.bottom() + 22.0), Align2::CENTER_TOP, if p.use_gps_distance && p.has_coords() { "distance [m] (GPS)" } else { "distance [m]" }, font.clone(), axis_col);
+        painter.text(Pos2::new(plot.center().x, plot.bottom() + 22.0), Align2::CENTER_TOP, if migrated { "horizontal distance [m] (GPS)" } else if p.use_gps_distance && p.has_coords() { "distance [m] (GPS)" } else { "distance [m]" }, font.clone(), axis_col);
         // Distance in metres on top as well (trace numbers are in the status bar).
         let mut d = (d0 / step).ceil() * step;
         while d <= d1 + 1e-9 {
-            let x = fr.x_of_trace(p.trace_at_dist(d));
+            let x = fr.x_of_trace(p.axis_trace_at_dist(if reversed { p.axis_length() - d } else { d }));
             if x >= plot.left() - 0.5 && x <= plot.right() + 0.5 {
                 painter.line_segment([Pos2::new(x, plot.top()), Pos2::new(x, plot.top() - 4.0)], Stroke::new(1.0, axis_col));
                 painter.text(Pos2::new(x, plot.top() - 5.0), Align2::CENTER_BOTTOM, fmt_tick(d, step), font.clone(), axis_col);
             }
             d += step;
         }
-        let src = if p.use_gps_distance && p.has_coords() { "from GPS".to_string() } else { format!("trace spacing {} m", format!("{:.6}", p.dx).trim_end_matches('0').trim_end_matches('.')) };
+        let src = if migrated || p.use_gps_distance && p.has_coords() { "from GPS".to_string() } else { format!("trace spacing {} m", format!("{:.6}", p.dx).trim_end_matches('0').trim_end_matches('.')) };
         painter.text(Pos2::new(plot.left(), avail.top() + 2.0), Align2::LEFT_TOP, format!("distance [m] · {src}"), font.clone(), Color32::GRAY);
 
         // ---------------------------------------------------------- picks overlay
@@ -336,15 +363,15 @@ impl App {
                 plot_painter.text(*f + egui::vec2(4.0, -4.0), Align2::LEFT_BOTTOM, format!("#{} {}", l.id, t.name), FontId::proportional(10.5), c32(t.color));
             }
         };
-        for l in self.lines.iter().filter(|l| l.profile_id == pid) {
+        for l in self.lines.iter().filter(|l| !migrated && l.profile_id == pid) {
             draw_line(l, false, self.selected_pick == Some(l.id));
         }
         if let Some(l) = &self.open_line {
-            if l.profile_id == pid {
+            if !migrated && l.profile_id == pid {
                 draw_line(l, true, false);
             }
         }
-        for m in self.markers.iter().filter(|m| m.profile_id == pid) {
+        for m in self.markers.iter().filter(|m| !migrated && m.profile_id == pid) {
             let Some(t) = self.marker_types.get(m.type_idx) else { continue };
             let pos = marker_pos(m);
             if !plot.expand(10.0).contains(pos) {
@@ -376,7 +403,7 @@ impl App {
             }
         }
         // Active hyperbola fit
-        if let Some(hf) = &self.hyperbola {
+        if let Some(hf) = self.hyperbola.as_ref().filter(|_| !migrated) {
             let mut pts = Vec::new();
             let d0 = p.dist_at(hf.trace);
             let n = plot.width() as usize / 2;
@@ -415,7 +442,7 @@ impl App {
             let cur_name = self.marker_types.get(cur_type).map(|t| t.name.clone()).unwrap_or_default();
             let other_type_msg = format!("That pick is of another type – only \"{cur_name}\" picks can be deleted now. Choose its type in the toolbar to delete it.");
             // Snap preview
-            if matches!(self.mode, PickMode::Point | PickMode::Hyperbola | PickMode::Layer) && self.snap != Snap::None {
+            if !migrated && matches!(self.mode, PickMode::Point | PickMode::Hyperbola | PickMode::Layer) && self.snap != Snap::None {
                 let ss = self.snap_at(p, tri, s);
                 plot_painter.circle_stroke(Pos2::new(fr.x_of_trace(tri as f32), fr.y_of_sample(ss + shift(tri as f32))), 4.0, Stroke::new(1.5, Color32::from_rgb(0, 255, 255)));
             }
@@ -457,7 +484,7 @@ impl App {
                 }
                 best.map(|b| b.1)
             };
-            if resp.clicked() {
+            if resp.clicked() && !migrated {
                 match self.mode {
                     PickMode::Navigate => action = Some(Action::Select(nearest_pick(None))),
                     PickMode::Delete => {
@@ -488,7 +515,7 @@ impl App {
                 }
             }
             // Right-click deletes the pick under the cursor (in the picking modes).
-            if resp.secondary_clicked() && !mods.shift && matches!(self.mode, PickMode::Point | PickMode::Hyperbola | PickMode::Layer | PickMode::Delete) {
+            if !migrated && resp.secondary_clicked() && !mods.shift && matches!(self.mode, PickMode::Point | PickMode::Hyperbola | PickMode::Layer | PickMode::Delete) {
                 let near_fit = self.hyperbola.as_ref().map(|hf| {
                     let trh = fr.trace_of_x(hp.x);
                     let dx = (p.dist_at(trh) - p.dist_at(hf.trace)) as f32;
@@ -511,7 +538,7 @@ impl App {
                     action = Some(Action::Status("Right-click on a pick to delete it (Shift + right-drag deletes all picks in a box).".into()));
                 }
             }
-            if self.mode == PickMode::Hyperbola && resp.dragged_by(egui::PointerButton::Primary) {
+            if !migrated && self.mode == PickMode::Hyperbola && resp.dragged_by(egui::PointerButton::Primary) {
                 if let Some(hf) = &self.hyperbola {
                     let t = p.proc.y_of(s);
                     let dx = (p.dist_at(tr) - p.dist_at(hf.trace)).abs() as f32;
@@ -523,12 +550,12 @@ impl App {
             }
         }
         // Shift + right-drag: delete every pick inside the box.
-        if mods.shift && resp.drag_started_by(egui::PointerButton::Secondary) {
+        if !migrated && mods.shift && resp.drag_started_by(egui::PointerButton::Secondary) {
             if let Some(pp) = resp.interact_pointer_pos() {
                 self.select_rect = Some((pp, pp));
             }
         }
-        if let Some((a0, _)) = self.select_rect {
+        if !migrated { if let Some((a0, _)) = self.select_rect {
             if let Some(pp) = ui.input(|i| i.pointer.latest_pos()) {
                 self.select_rect = Some((a0, pp));
             }
@@ -559,14 +586,14 @@ impl App {
                     Action::DeleteMany(ids)
                 });
             }
-        }
+        }}
         if let Some(hf) = &mut self.hyperbola {
             if self.mode == PickMode::Hyperbola && hover_pos.is_some() && mods.alt && scroll.y != 0.0 {
                 hf.velocity = (hf.velocity * (scroll.y * 0.001).exp()).clamp(0.01, 0.3);
             }
         }
         let (enter, backspace, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Backspace), i.key_pressed(egui::Key::Escape)));
-        if enter {
+        if enter && !migrated {
             if self.hyperbola.is_some() {
                 self.save_hyperbola();
             } else if self.open_line.is_some() {

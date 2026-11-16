@@ -92,7 +92,7 @@ fn read_cor(text: &str) -> Vec<GpsFix> {
         // Find "N"/"S" and "E"/"W" markers; the number before each is the coordinate.
         let mut lat = None;
         let mut lon = None;
-        let mut alt = 0.0;
+        let mut alt = None;
         for i in 1..tok.len() {
             match tok[i] {
                 "N" | "S" if lat.is_none() => {
@@ -105,7 +105,7 @@ fn read_cor(text: &str) -> Vec<GpsFix> {
                         lon = Some(if tok[i] == "W" { -dm_or_deg(v) } else { dm_or_deg(v) });
                     }
                     if let Some(a) = tok.get(i + 1).and_then(|s| s.parse::<f64>().ok()) {
-                        alt = a;
+                        alt = Some(a);
                     }
                 }
                 _ => {}
@@ -113,7 +113,7 @@ fn read_cor(text: &str) -> Vec<GpsFix> {
         }
         if let (Some(la), Some(lo)) = (lat, lon) {
             // .cor trace numbers start at 1.
-            out.push(GpsFix { trace: (trace - 1.0).max(0.0), x: lo, y: la, z: alt });
+            out.push(GpsFix { trace: (trace - 1.0).max(0.0), x: lo, y: la, z: alt.unwrap_or(0.0), has_elevation: alt.is_some() });
         }
     }
     out
@@ -145,7 +145,7 @@ fn parse_nmea(line: &str) -> Option<(f64, f64, f64)> {
         if q == 0 {
             return None;
         }
-        let alt = f[9].parse().unwrap_or(0.0);
+        let alt = f[9].parse().ok()?;
         return Some((lon, lat, alt));
     }
     if kind.ends_with("RMC") && f.len() > 6 {
@@ -170,7 +170,7 @@ fn read_tagged_nmea(text: &str, tag: &str) -> Vec<GpsFix> {
             if let Some((x, y, z)) = parse_nmea(l) {
                 if l.contains("GGA") || !out.iter().any(|f: &GpsFix| f.trace == tr) {
                     out.retain(|f: &GpsFix| f.trace != tr);
-                    out.push(GpsFix { trace: tr, x, y, z });
+                    out.push(GpsFix { trace: tr, x, y, z, has_elevation: l.contains("GGA") });
                 }
             }
         }
@@ -187,12 +187,28 @@ fn read_pulseekko(text: &str) -> Vec<GpsFix> {
             cur = rest.split_whitespace().next().and_then(|s| s.parse::<f64>().ok()).map(|t| (t - 1.0).max(0.0));
         } else if let Some(tr) = cur {
             if let Some((x, y, z)) = parse_nmea(l) {
-                out.push(GpsFix { trace: tr, x, y, z });
-                cur = None;
+                if l.contains("GGA") || !out.iter().any(|f: &GpsFix| f.trace == tr) {
+                    out.retain(|f: &GpsFix| f.trace != tr);
+                    out.push(GpsFix { trace: tr, x, y, z, has_elevation: l.contains("GGA") });
+                }
             }
         }
     }
     out
+}
+
+#[cfg(test)]
+mod elevation_tests {
+    use super::*;
+
+    #[test]
+    fn pulseekko_prefers_measured_gga_height_over_rmc_placeholder() {
+        let text = "Trace #1\n$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W\n$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,\n";
+        let fixes = read_pulseekko(text);
+        assert_eq!(fixes.len(), 1);
+        assert!(fixes[0].has_elevation);
+        assert_eq!(fixes[0].z, 545.4);
+    }
 }
 
 fn read_nmea_all(text: &str) -> Vec<(f64, f64, f64)> {
@@ -207,7 +223,7 @@ fn spread(pts: Vec<(f64, f64, f64)>, ntr: usize) -> Vec<GpsFix> {
     let span = ntr.saturating_sub(1).max(1) as f64;
     pts.into_iter()
         .enumerate()
-        .map(|(i, (x, y, z))| GpsFix { trace: if n > 1 { i as f64 * span / (n - 1) as f64 } else { 0.0 }, x, y, z })
+        .map(|(i, (x, y, z))| GpsFix { trace: if n > 1 { i as f64 * span / (n - 1) as f64 } else { 0.0 }, x, y, z, has_elevation: true })
         .collect()
 }
 
@@ -238,8 +254,8 @@ fn read_table(text: &str, table_crs: &CrsSpec) -> (Vec<GpsFix>, CrsSpec) {
         let (tc, xc, yc, zc, _) = cols.unwrap_or((0, 1, 2, if tok.len() > 3 { Some(3) } else { None }, false));
         let get = |i: usize| tok.get(i).and_then(|s| s.parse::<f64>().ok());
         if let (Some(t), Some(x), Some(y)) = (get(tc), get(xc), get(yc)) {
-            let z = zc.and_then(get).unwrap_or(0.0);
-            out.push(GpsFix { trace: t, x, y, z });
+            let height = zc.and_then(get);
+            out.push(GpsFix { trace: t, x, y, z: height.unwrap_or(0.0), has_elevation: height.is_some() });
         }
     }
     // Trace numbers starting at 1 are moved to 0-based.
