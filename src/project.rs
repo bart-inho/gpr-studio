@@ -257,6 +257,11 @@ mod topographic_project_tests {
         app.profiles[0].steps.push(StepEntry { enabled: true, step: Step::TopographicKirchhoff { velocity: 0.1, width: 20, t_start: 0.0, t_end: 1e9, gps_above_antenna_m: 0.2, max_gap_m: 2.0 } });
         app.reprocess(0);
         assert!(app.profiles[0].proc.depth_datum_m.is_some(), "{:?}", app.profiles[0].log);
+        // Picking on the migrated view: time ↔ depth below datum round-trips, time 0 sits on the local surface.
+        let p = &app.profiles[0];
+        let (datum, z) = (p.proc.depth_datum_m.unwrap(), p.coord_at(10.0).unwrap()[2]);
+        assert!((p.y_of_pick_time(10.0, 0.0) as f64 - (datum - (z - 0.2))).abs() < 1e-3);
+        assert!((p.pick_time_of_y(10.0, p.y_of_pick_time(10.0, 15.0)) - 15.0).abs() < 1e-3);
         app.markers.push(Marker { id: 1, profile_id: id, type_idx: 0, trace: 10.0, time_ns: 15.0, amplitude: 1.0, velocity: None, comment: "original pick".into() });
         let path = PathBuf::from("target/topographic-reopen.gprproj");
         save(&app, &path).unwrap();

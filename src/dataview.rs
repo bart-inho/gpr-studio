@@ -121,7 +121,7 @@ impl App {
             });
         }
         if migrated {
-            ui.label("Topographic migration: depth below highest antenna. Acquisition-time picks are hidden; disable this step to edit them.");
+            ui.label("Topographic migration: depth below highest antenna. Picks are stored as acquisition time below the local surface.");
         }
 
         let avail = ui.available_rect_before_wrap();
@@ -134,6 +134,7 @@ impl App {
         if plot.width() < 50.0 || plot.height() < 50.0 {
             return;
         }
+        self.plot_px = [plot.width(), plot.height()];
         let resp = ui.interact(plot, ui.id().with("dataview"), Sense::click_and_drag());
         ui.allocate_rect(avail, Sense::hover());
 
@@ -339,11 +340,11 @@ impl App {
 
         // ---------------------------------------------------------- picks overlay
         let marker_pos = |m: &Marker| -> Pos2 {
-            let y = if depth_sec { p.depth_of_time(m.time_ns) } else { m.time_ns };
+            let y = p.y_of_pick_time(m.trace, m.time_ns);
             Pos2::new(fr.x_of_trace(m.trace), fr.y_of_sample(p.proc.sample_of(y) + shift(m.trace)))
         };
         let line_pt = |tr: f32, t: f32| -> Pos2 {
-            let y = if depth_sec { p.depth_of_time(t) } else { t };
+            let y = p.y_of_pick_time(tr, t);
             Pos2::new(fr.x_of_trace(tr), fr.y_of_sample(p.proc.sample_of(y) + shift(tr)))
         };
         let draw_line = |l: &LinePick, open: bool, sel: bool| {
@@ -363,15 +364,15 @@ impl App {
                 plot_painter.text(*f + egui::vec2(4.0, -4.0), Align2::LEFT_BOTTOM, format!("#{} {}", l.id, t.name), FontId::proportional(10.5), c32(t.color));
             }
         };
-        for l in self.lines.iter().filter(|l| !migrated && l.profile_id == pid) {
+        for l in self.lines.iter().filter(|l| l.profile_id == pid) {
             draw_line(l, false, self.selected_pick == Some(l.id));
         }
         if let Some(l) = &self.open_line {
-            if !migrated && l.profile_id == pid {
+            if l.profile_id == pid {
                 draw_line(l, true, false);
             }
         }
-        for m in self.markers.iter().filter(|m| !migrated && m.profile_id == pid) {
+        for m in self.markers.iter().filter(|m| m.profile_id == pid) {
             let Some(t) = self.marker_types.get(m.type_idx) else { continue };
             let pos = marker_pos(m);
             if !plot.expand(10.0).contains(pos) {
@@ -442,7 +443,7 @@ impl App {
             let cur_name = self.marker_types.get(cur_type).map(|t| t.name.clone()).unwrap_or_default();
             let other_type_msg = format!("That pick is of another type – only \"{cur_name}\" picks can be deleted now. Choose its type in the toolbar to delete it.");
             // Snap preview
-            if !migrated && matches!(self.mode, PickMode::Point | PickMode::Hyperbola | PickMode::Layer) && self.snap != Snap::None {
+            if matches!(self.mode, PickMode::Point | PickMode::Hyperbola | PickMode::Layer) && self.snap != Snap::None {
                 let ss = self.snap_at(p, tri, s);
                 plot_painter.circle_stroke(Pos2::new(fr.x_of_trace(tri as f32), fr.y_of_sample(ss + shift(tri as f32))), 4.0, Stroke::new(1.5, Color32::from_rgb(0, 255, 255)));
             }
@@ -484,7 +485,7 @@ impl App {
                 }
                 best.map(|b| b.1)
             };
-            if resp.clicked() && !migrated {
+            if resp.clicked() {
                 match self.mode {
                     PickMode::Navigate => action = Some(Action::Select(nearest_pick(None))),
                     PickMode::Delete => {
@@ -497,7 +498,7 @@ impl App {
                     PickMode::Point => {
                         let ss = self.snap_at(p, tri, s);
                         let y = p.proc.y_of(ss);
-                        let t = if depth_sec { p.time_of_depth(y) } else { y };
+                        let t = p.pick_time_of_y(tri as f32, y);
                         action = Some(Action::Point(tri as f32, t, p.proc.value(tri, ss.round() as usize)));
                     }
                     PickMode::Hyperbola => {
@@ -515,7 +516,7 @@ impl App {
                 }
             }
             // Right-click deletes the pick under the cursor (in the picking modes).
-            if !migrated && resp.secondary_clicked() && !mods.shift && matches!(self.mode, PickMode::Point | PickMode::Hyperbola | PickMode::Layer | PickMode::Delete) {
+            if resp.secondary_clicked() && !mods.shift && matches!(self.mode, PickMode::Point | PickMode::Hyperbola | PickMode::Layer | PickMode::Delete) {
                 let near_fit = self.hyperbola.as_ref().map(|hf| {
                     let trh = fr.trace_of_x(hp.x);
                     let dx = (p.dist_at(trh) - p.dist_at(hf.trace)) as f32;
@@ -538,7 +539,7 @@ impl App {
                     action = Some(Action::Status("Right-click on a pick to delete it (Shift + right-drag deletes all picks in a box).".into()));
                 }
             }
-            if !migrated && self.mode == PickMode::Hyperbola && resp.dragged_by(egui::PointerButton::Primary) {
+            if self.mode == PickMode::Hyperbola && resp.dragged_by(egui::PointerButton::Primary) {
                 if let Some(hf) = &self.hyperbola {
                     let t = p.proc.y_of(s);
                     let dx = (p.dist_at(tr) - p.dist_at(hf.trace)).abs() as f32;
@@ -550,12 +551,12 @@ impl App {
             }
         }
         // Shift + right-drag: delete every pick inside the box.
-        if !migrated && mods.shift && resp.drag_started_by(egui::PointerButton::Secondary) {
+        if mods.shift && resp.drag_started_by(egui::PointerButton::Secondary) {
             if let Some(pp) = resp.interact_pointer_pos() {
                 self.select_rect = Some((pp, pp));
             }
         }
-        if !migrated { if let Some((a0, _)) = self.select_rect {
+        if let Some((a0, _)) = self.select_rect {
             if let Some(pp) = ui.input(|i| i.pointer.latest_pos()) {
                 self.select_rect = Some((a0, pp));
             }
@@ -586,14 +587,14 @@ impl App {
                     Action::DeleteMany(ids)
                 });
             }
-        }}
+        }
         if let Some(hf) = &mut self.hyperbola {
             if self.mode == PickMode::Hyperbola && hover_pos.is_some() && mods.alt && scroll.y != 0.0 {
                 hf.velocity = (hf.velocity * (scroll.y * 0.001).exp()).clamp(0.01, 0.3);
             }
         }
         let (enter, backspace, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Backspace), i.key_pressed(egui::Key::Escape)));
-        if enter && !migrated {
+        if enter {
             if self.hyperbola.is_some() {
                 self.save_hyperbola();
             } else if self.open_line.is_some() {
@@ -686,15 +687,7 @@ impl App {
             }
             Action::LayerPoint(tr, s, finish) => {
                 let p = &self.profiles[a];
-                let depth_sec = p.proc.depth_axis;
-                let to_t = |s: f32| {
-                    let y = p.proc.y_of(s);
-                    if depth_sec {
-                        p.time_of_depth(y)
-                    } else {
-                        y
-                    }
-                };
+                let to_t = |tr: usize, s: f32| p.pick_time_of_y(tr as f32, p.proc.y_of(s));
                 let ti = if self.marker_types.get(self.cur_type).map(|t| t.kind == MarkerKind::Line).unwrap_or(false) {
                     self.cur_type
                 } else {
@@ -715,7 +708,7 @@ impl App {
                     // Follow the phase from the last point to the new one, trace by trace.
                     let ptr_i = ptr.round() as isize;
                     let tr_i = tr as isize;
-                    let ps = p.proc.sample_of(if depth_sec { p.depth_of_time(pt) } else { pt });
+                    let ps = p.proc.sample_of(p.y_of_pick_time(ptr, pt));
                     let n = (tr_i - ptr_i).abs();
                     let dir = (tr_i - ptr_i).signum();
                     let mut cur = ps;
@@ -732,10 +725,10 @@ impl App {
                         if k == n {
                             cur = s;
                         }
-                        new_pts.push((t_i as f32, to_t(cur)));
+                        new_pts.push((t_i as f32, to_t(t_i, cur)));
                     }
                 } else {
-                    new_pts.push((tr as f32, to_t(s)));
+                    new_pts.push((tr as f32, to_t(tr, s)));
                 }
                 line.points.extend(new_pts);
                 self.open_line = Some(line);

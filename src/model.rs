@@ -232,14 +232,21 @@ impl Profile {
         }
         let mut fixes = track.fixes.clone();
         fixes.sort_by(|a, b| a.trace.total_cmp(&b.trace));
-        if fixes.len() < 2 || fixes[0].trace > 0.0 || fixes.last().unwrap().trace < (self.raw.ntr - 1) as f64 {
-            return Err("GPS elevations must cover the first and last trace; extrapolation is not allowed.".into());
+        if fixes.len() < 2 {
+            return Err("Topographic Kirchhoff needs at least two GPS positions with elevations.".into());
         }
         if fixes.iter().any(|f| !f.has_elevation || !f.trace.is_finite() || !f.x.is_finite() || !f.y.is_finite() || !f.z.is_finite()) {
             return Err("GPS heights are missing or unverified. Re-associate a GPS file containing measured elevations.".into());
         }
         let mut pts: Vec<_> = fixes.iter().map(|f| [f.x, f.y, f.z]).collect();
         crate::crs::transform_spec(&track.crs, project_crs, &mut pts)?;
+        // Traces before the first / after the last fix are extrapolated; bound them like any other gap.
+        for (c, p, end) in [(self.coords[0], pts[0], "start"), (self.coords[self.raw.ntr - 1], pts[pts.len() - 1], "end")] {
+            let d = (c[0] - p[0]).hypot(c[1] - p[1]);
+            if !d.is_finite() || d > max_gap_m as f64 {
+                return Err(format!("GPS stops {d:.2} m before the profile {end} (limit {max_gap_m:.2} m); add measured positions or increase the stated gap limit."));
+            }
+        }
         for (i, pair) in fixes.windows(2).enumerate() {
             let trace_gap = pair[1].trace - pair[0].trace;
             let dx = pts[i + 1][0] - pts[i][0];
@@ -377,6 +384,39 @@ impl Profile {
             0.0
         }
     }
+
+    /// Pick time (acquisition ns) at a trace → y value of the processed section, and back.
+    pub fn y_of_pick_time(&self, tr: f32, t: f32) -> f32 {
+        match self.topo_pick_frame(tr) {
+            Some((surface, v)) => surface + v * t / 2.0,
+            None => if self.proc.depth_axis { self.depth_of_time(t) } else { t },
+        }
+    }
+    pub fn pick_time_of_y(&self, tr: f32, y: f32) -> f32 {
+        match self.topo_pick_frame(tr) {
+            Some((surface, v)) => (2.0 * (y - surface) / v).max(0.0),
+            None => if self.proc.depth_axis { self.time_of_depth(y) } else { y },
+        }
+    }
+    /// Topographic migration: (surface depth below datum at this trace, migration velocity), as in `topographic_kirchhoff`.
+    fn topo_pick_frame(&self, tr: f32) -> Option<(f32, f32)> {
+        let datum = self.proc.depth_datum_m?;
+        let v = self.steps.iter().find_map(|e| match &e.step {
+            crate::processing::Step::TopographicKirchhoff { velocity, .. } if e.enabled && *velocity > 0.0 => Some(*velocity),
+            _ => None,
+        })?;
+        let z = self.coord_at(tr)?[2];
+        Some(((datum - (z - self.antenna_height_correction())) as f32, v))
+    }
+
+    /// Visible sample range height for a 1:1 metre scale at this horizontal trace span and plot size.
+    pub fn one_to_one_samples(&self, traces: f32, plot: [f32; 2]) -> Option<f32> {
+        let n = self.proc.ntr.max(2) as f64;
+        let m_per_tr = self.axis_length() / (n - 1.0);
+        let m_per_s = if self.proc.depth_axis { self.proc.dt } else { self.depth_of_time(self.proc.dt) } as f64;
+        let s = traces as f64 * m_per_tr / m_per_s * (plot[1] / plot[0]) as f64;
+        (s.is_finite() && s > 0.0).then_some(s as f32)
+    }
 }
 
 fn interp_fix(fixes: &[(f64, [f64; 3])], t: f64) -> [f64; 3] {
@@ -392,9 +432,8 @@ fn interp_fix(fixes: &[(f64, [f64; 3])], t: f64) -> [f64; 3] {
         (&fixes[idx - 1], &fixes[idx])
     };
     let span = b.0 - a.0;
+    // Beyond the ends this extrapolates linearly along the end segment (loggers often stop a few traces early).
     let f = if span.abs() > 1e-12 { (t - a.0) / span } else { 0.0 };
-    // Extrapolation beyond the ends is held at the end fix.
-    let f = if idx == 0 || idx >= fixes.len() { f.clamp(0.0, 1.0) } else { f };
     [
         a.1[0] + (b.1[0] - a.1[0]) * f,
         a.1[1] + (b.1[1] - a.1[1]) * f,
@@ -538,6 +577,10 @@ mod orientation_tests {
         p.gps.as_mut().unwrap().fixes.remove(2);
         assert!(p.topographic_geometry(&crs, 1.1).is_err()); // Unsupported 2 m GPS gap.
         p.gps.as_mut().unwrap().fixes.remove(0);
-        assert!(p.topographic_geometry(&crs, 3.0).is_err()); // No first-trace elevation.
+        p.update_coords(&crs);
+        assert!(p.topographic_geometry(&crs, 0.5).is_err()); // First trace 1 m before the first fix.
+        let g = p.topographic_geometry(&crs, 3.0).unwrap(); // Short head gap is extrapolated.
+        assert_eq!(g.x_m, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+        assert!((g.elevation_m[0] - 500.0).abs() < 1e-9);
     }
 }

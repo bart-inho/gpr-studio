@@ -164,6 +164,8 @@ pub struct App {
     pub topo_cache: Option<(String, crate::model::Section)>,
     /// Per profile: was topography shown last frame (to refit the time axis when it changes).
     pub topo_shown: HashMap<u32, bool>,
+    /// Last radargram plot size in points (for the 1x1 ratio button).
+    pub plot_px: [f32; 2],
     /// Show topography (one setting for every profile).
     pub show_topo: bool,
     /// The project as last saved or opened (None = never saved).
@@ -243,6 +245,7 @@ impl App {
             allow_close: false,
             topo_cache: None,
             topo_shown: HashMap::new(),
+            plot_px: [0.0, 0.0],
             show_topo: false,
             saved_snapshot: None,
             remember_projects: true,
@@ -1470,6 +1473,25 @@ impl App {
                         }
                     }
                     self.status = format!("Oriented {oriented} profile(s) from GPS; profiles without a clear direction were skipped.");
+                }
+                if ui.add_enabled(self.active_profile().is_some(), egui::Button::new("1x1 ratio"))
+                    .on_hover_text("Same metres per pixel horizontally and vertically (time sections use the toolbar velocity)")
+                    .clicked()
+                {
+                    let plot = self.plot_px;
+                    if let Some(p) = self.active_profile() {
+                        let (id, ntr, ns) = (p.id, p.proc.ntr as f32, p.proc.ns as f32);
+                        let mut v = self.views.get(&id).cloned().unwrap_or(ViewState { tr0: 0.0, tr1: ntr, s0: 0.0, s1: ns });
+                        if let Some(ws) = p.one_to_one_samples(v.tr1 - v.tr0, plot) {
+                            // Too tall for the section: keep the full height and narrow the trace span instead.
+                            let (wtr, ws) = if ws > ns { ((v.tr1 - v.tr0) * ns / ws, ns) } else { (v.tr1 - v.tr0, ws) };
+                            let c = (v.tr0 + v.tr1) / 2.0;
+                            v = ViewState { tr0: c - wtr / 2.0, tr1: c + wtr / 2.0, s0: v.s0, s1: v.s0 + ws };
+                            self.views.insert(id, v);
+                        } else {
+                            self.status = "1x1 ratio needs a known trace spacing, velocity and a visible profile.".into();
+                        }
+                    }
                 }
             });
         });
