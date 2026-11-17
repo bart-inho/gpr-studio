@@ -217,20 +217,6 @@ impl Grid {
         let (a, b) = self.depth_m.iter().filter(|v| v.is_finite()).fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
         (a <= b).then_some((a, b))
     }
-    /// Non-empty cells: (x, y, time ns, depth m, altitude m).
-    pub fn cells(&self) -> Vec<[f64; 5]> {
-        let mut out = Vec::new();
-        for j in 0..self.ny {
-            for i in 0..self.nx {
-                let k = j * self.nx + i;
-                if self.depth_m[k].is_finite() {
-                    let (x, y) = (self.origin[0] + (i as f64 + 0.5) * self.cell_m, self.origin[1] + (j as f64 + 0.5) * self.cell_m);
-                    out.push([x, y, self.time_ns[k] as f64, self.depth_m[k] as f64, self.altitude_m[k] as f64]);
-                }
-            }
-        }
-        out
-    }
     /// Depth at a map position: bilinear between the 4 neighbouring cells, the nearest cell when one is empty.
     pub fn depth_at(&self, x: f64, y: f64) -> Option<f32> {
         let fx = (x - self.origin[0]) / self.cell_m - 0.5;
@@ -277,7 +263,7 @@ pub struct InPt {
 pub fn zone_points(profiles: &[Profile], lines: &[LinePick], zone: &Zone, step: f64) -> Vec<InPt> {
     let mut out = Vec::new();
     for l in lines.iter().filter(|l| l.type_idx == zone.type_idx) {
-        let Some(p) = profiles.iter().find(|p| p.id == l.profile_id && p.has_coords()) else { continue };
+        let Some(p) = profiles.iter().find(|p| p.id == l.profile_id && !p.coords.is_empty()) else { continue };
         let mut push = |tr: f32, t: f32| {
             if let Some(c) = p.coord_at(tr) {
                 if inside(&zone.polygon, c[0], c[1]) {

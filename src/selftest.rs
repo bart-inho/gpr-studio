@@ -282,13 +282,28 @@ pub fn run(out: PathBuf, files: Vec<PathBuf>) -> i32 {
     match app.export_gpkg(&g) {
         Ok(s) => {
             println!("GPKG OK {} ({s}) in {:.3} s", g.display(), export_started.elapsed().as_secs_f64());
-            let rows = rusqlite::Connection::open(&g).and_then(|c| c.query_row("SELECT COUNT(*), SUM(time_ns IS NULL OR depth_m IS NULL OR altitude_m IS NULL OR time_ns != time_ns) FROM interpolations", [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0)))));
-            match rows {
-                Ok((n, 0)) if n > 0 => println!("GPKG interpolations: {n} rows, all finite"),
-                other => {
-                    println!("FAIL: GPKG interpolations {other:?}");
-                    fails += 1;
+            let raster = (|| -> Result<usize, String> {
+                let c = rusqlite::Connection::open(&g).map_err(|e| e.to_string())?;
+                let kind: String = c.query_row("SELECT data_type FROM gpkg_contents WHERE table_name='interpolations'", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+                if kind != "2d-gridded-coverage" { return Err(format!("unexpected raster kind: {kind}")); }
+                let (matrix, extensions): (i64, i64) = (
+                    c.query_row("SELECT count(*) FROM gpkg_tile_matrix WHERE table_name='interpolations'", [], |r| r.get(0)).map_err(|e| e.to_string())?,
+                    c.query_row("SELECT count(*) FROM gpkg_extensions WHERE extension_name='gpkg_2d_gridded_coverage'", [], |r| r.get(0)).map_err(|e| e.to_string())?);
+                if matrix != 1 || extensions != 3 { return Err("missing raster matrix or extension metadata".into()); }
+                let bytes: Vec<u8> = c.query_row("SELECT tile_data FROM interpolations LIMIT 1", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+                let mut decoder = tiff::decoder::Decoder::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
+                match decoder.read_image().map_err(|e| e.to_string())? {
+                    tiff::decoder::DecodingResult::F32(pixels) => {
+                        let filled = pixels.iter().filter(|v| v.is_finite() && **v != -9999.0).count();
+                        if filled == 0 { return Err("raster tile has no depth values".into()); }
+                        Ok(filled)
+                    }
+                    _ => Err("raster tile is not Float32".into()),
                 }
+            })();
+            match raster {
+                Ok(n) => println!("GPKG interpolations: Float32 raster, {n} values checked"),
+                Err(e) => { println!("FAIL: GPKG interpolations {e}"); fails += 1; }
             }
         }
         Err(e) => {

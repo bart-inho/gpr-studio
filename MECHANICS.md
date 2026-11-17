@@ -105,8 +105,13 @@ the left axis is time below the highest point, the right axis elevation = z_max 
 ## Exports
 GeoPackage 1.2 (application_id 0x47504B47, user_version 10200): `profiles` (LineStringZ), `trace_points`, `markers` (PointZ),
 `layer_picks` (LineStringZ, elevation = surface − depth) and `layer_pick_vertices`; SRS = project CRS (WKT from the EPSG table).
-`interpolations` (PointZ, one row per non-empty cell, z = altitude: zone, pick_type, time_ns, depth_m, altitude_m,
-max_radius_m, cell_size_m) and `interpolation_zones` (Polygon, 2D). Points rather than a raster tile table: QGIS styles them with any ramp.
+`interpolations` is one OGC 2d-gridded-coverage Float32 raster of the chosen depth, time or altitude
+value, with 256×256 TIFF tiles at zoom level 0. Its matrix starts at the snapped union's north-west
+corner: tile row 0 is north, while interpolation grids store rows south-to-north. The common cell
+size is the smallest zone cell size; nearest-cell sampling oversamples coarser zones. Later zones
+replace earlier values only at finite cells. Empty cells and edge padding are `-9999` NoData;
+all-empty tiles are omitted. The tile matrix and ancillary tables store extent, spacing, unit and
+NoData; the project CRS must be projected in metres. No interpolation table is written without a grid.
 PDF: A4/A3 landscape; per page radargram section + GPS map framed to the whole survey, with the current profile and section highlighted + tables. The optional 1×1 metre scale is on by default: it keeps the chosen metres per page, uses equal horizontal and vertical metre scales when the depth fits, and compresses the vertical scale when needed to show the full depth. Whole-profile pages use the full vertical range; visible-section pages keep the current vertical view.
 
 ## Topographic Kirchhoff migration

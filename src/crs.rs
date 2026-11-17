@@ -52,6 +52,10 @@ impl CrsSpec {
         let proj = Proj::from_proj_string(&p4).map_err(|e| format!("cannot use {}: {e:?}", self.short()))?;
         Ok(Crs { spec: self.clone(), geographic: proj.is_latlong(), proj })
     }
+    pub fn is_projected_metres(&self) -> Result<bool, String> {
+        let crs = self.build()?;
+        Ok(!crs.geographic && (crs.proj.to_meter() - 1.0).abs() < 1e-9)
+    }
     /// Parse "2056", "EPSG:2056" or a "+proj=..." string.
     pub fn parse(text: &str) -> Option<CrsSpec> {
         let t = text.trim();

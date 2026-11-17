@@ -4,6 +4,7 @@ use crate::basemap::{self, Basemap};
 use crate::crs::{self, CrsSpec};
 use crate::formats::{self, ImportOptions, SegyTimeUnit};
 use crate::gps::GpsFormat;
+use crate::gpkg::RasterValue;
 use crate::model::*;
 use crate::processing::{self, BgMode, Ctx, Divergence, Snap, Step, StepEntry, Taper, TimeZeroMode};
 use crate::render::ColorMap;
@@ -23,6 +24,76 @@ pub enum PickMode {
     Delete,
 }
 
+#[cfg(test)]
+mod manual_map_tests {
+    use super::*;
+
+    #[test]
+    fn manual_trace_spacing_updates_all_profiles() {
+        let mut app = App::headless(vec![], None);
+        for n in 1..=3 {
+            app.add_profile(Profile::new(format!("line_{n}"), PathBuf::new(), "test", Section::new(5, 17, 0.1), 0.05));
+        }
+        app.profiles[1].coords = (0..17).map(|i| [i as f64 * 0.1, 0.0, 0.0]).collect();
+        app.profiles[1].update_distance();
+        let versions: Vec<u64> = app.profiles.iter().map(|p| p.version).collect();
+        let from_file: Vec<bool> = app.profiles.iter().map(|p| p.dx_from_file).collect();
+        app.set_trace_spacing_all(0.2);
+        for (i, p) in app.profiles.iter().enumerate() {
+            assert_eq!(p.dx, 0.2);
+            assert!(p.dx_user_set);
+            assert_eq!(p.dx_from_file, from_file[i]);
+            assert_eq!(p.version, versions[i] + 1);
+        }
+        assert!((app.profiles[0].dist[16] - 3.2).abs() < 1e-6);
+        assert!((app.profiles[1].dist[16] - 1.6).abs() < 1e-9);
+        assert!((app.profiles[2].dist[16] - 3.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn toolbar_velocity_updates_all_but_hyperbola_calibrates_one() {
+        let mut app = App::headless(vec![], None);
+        for n in 1..=3 {
+            app.add_profile(Profile::new(format!("line_{n}"), PathBuf::new(), "test", Section::new(5, 17, 0.1), 0.05));
+        }
+        let versions: Vec<_> = app.profiles.iter().map(|p| p.version).collect();
+        app.set_velocity_all(0.12);
+        for (p, version) in app.profiles.iter().zip(&versions) {
+            assert_eq!(p.velocity, 0.12);
+            assert_eq!(p.version, version + 1);
+        }
+        app.active = Some(1);
+        app.hyperbola = Some(HyperbolaFit { trace: 5.0, time_ns: 10.0, velocity: 0.08 });
+        app.apply_hyperbola_velocity();
+        assert_eq!(app.profiles.iter().map(|p| p.velocity).collect::<Vec<_>>(), [0.12, 0.08, 0.12]);
+        assert_eq!(app.profiles[1].version, versions[1] + 2);
+    }
+
+    #[test]
+    fn map_mode_switch_preserves_gps_coordinates() {
+        let mut app = App::headless(vec![], None);
+        app.load_demo(false);
+        let gps: Vec<_> = app.profiles.iter().map(|p| p.coords.clone()).collect();
+        let csv = "Mode\tArea Scan\nGrid Size - X [cm]\t160\nGrid Size - Y [cm]\t120\nGrid Spacing - X [cm]\t10\nGrid Spacing - Y [cm]\t10\nSCAN DISTANCE [m]\nLine 18\t1.60\n";
+        app.import_manual_grid(csv, "scan.csv").unwrap();
+        let id = app.profiles[0].id;
+        app.assign_manual_line(id, Some(18));
+        app.set_map_mode(MapMode::Manual);
+        assert_eq!(app.profiles[0].map_coords(true).len(), app.profiles[0].raw.ntr);
+        app.set_map_mode(MapMode::Gps);
+        assert!(app.profiles.iter().zip(gps).all(|(p, original)| p.coords == original));
+    }
+
+    #[test]
+    fn rejected_manual_csv_leaves_project_unchanged() {
+        let mut app = App::headless(vec![], None);
+        app.load_demo(false);
+        let before = crate::project::snapshot(&app);
+        assert!(app.import_manual_grid("Mode\tArea Scan\n", "bad.csv").unwrap_err().contains("Grid Size X"));
+        assert_eq!(crate::project::snapshot(&app), before);
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum YAxis {
     Time,
@@ -36,6 +107,13 @@ pub enum MapPlacement {
     Right,
     Bottom,
     Window,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum MapMode {
+    #[default]
+    Gps,
+    Manual,
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +259,8 @@ pub struct App {
     pub selected_pick: Option<u32>,
     pub hover: Option<(f32, f32)>,
     pub map: MapState,
+    pub map_mode: MapMode,
+    pub manual_grid: Option<ManualGrid>,
     pub basemaps: Vec<Basemap>,
     pub basemap_jobs: Vec<BasemapJob>,
     pub show_map: bool,
@@ -217,6 +297,8 @@ pub struct App {
     pub plot_px: [f32; 2],
     /// Profiles just loaded: shown at 1x1 the first time the data view draws them.
     pub fit_one_to_one: std::collections::HashSet<u32>,
+    /// Scroll the profile list to the profile selected with an arrow key.
+    pub scroll_to_active: bool,
     /// Show topography (one setting for every profile).
     pub show_topo: bool,
     /// The project as last saved or opened (None = never saved).
@@ -286,6 +368,34 @@ impl App {
         p.one_to_one_traces(ns, self.plot_px).map(|wtr| one_to_one_view(v, wtr, ntr, ns))
     }
 
+    fn fit_all_profiles(&mut self) {
+        self.fit_one_to_one.clear();
+        for p in &self.profiles {
+            self.views.insert(p.id, ViewState { tr0: 0.0, tr1: p.proc.ntr as f32, s0: 0.0, s1: p.proc.ns as f32 });
+        }
+    }
+
+    fn one_to_one_all_profiles(&mut self) {
+        let views: Vec<_> = self.profiles.iter().enumerate().filter_map(|(i, p)| {
+            self.views.get(&p.id).and_then(|v| self.one_to_one(i, v)).map(|view| (p.id, view))
+        }).collect();
+        if views.len() != self.profiles.len() {
+            self.status = "1x1 ratio needs a known trace spacing, velocity and a visible profile.".into();
+            return;
+        }
+        self.fit_one_to_one.clear();
+        for (id, view) in views { self.views.insert(id, view); }
+    }
+
+    fn select_adjacent_profile(&mut self, direction: isize) {
+        if self.profiles.is_empty() { return; }
+        let current = self.active.unwrap_or(0).min(self.profiles.len() - 1);
+        self.active = Some(current.saturating_add_signed(direction).min(self.profiles.len() - 1));
+        self.scroll_to_active = true;
+        self.hover = None;
+        self.map.hover_trace = None;
+    }
+
     pub fn set_map_placement(&mut self, m: MapPlacement) {
         if m == self.settings.map_placement {
             return;
@@ -296,6 +406,77 @@ impl App {
         self.settings.map_placement = m;
         self.map.fitted = false;
         self.save_settings();
+    }
+
+    pub fn set_map_mode(&mut self, mode: MapMode) {
+        if self.map_mode == mode { return; }
+        self.map_mode = mode;
+        self.map.fitted = false;
+        for p in &mut self.profiles {
+            p.manual_active = mode == MapMode::Manual;
+            p.update_distance();
+            p.version += 1;
+        }
+    }
+
+    pub fn set_trace_spacing_all(&mut self, dx: f32) {
+        if !dx.is_finite() || dx <= 0.0 { return; }
+        for p in &mut self.profiles {
+            p.dx = dx;
+            p.dx_user_set = true;
+            p.update_distance();
+            p.version += 1;
+        }
+    }
+
+    fn set_velocity_all(&mut self, velocity: f32) {
+        for p in &mut self.profiles {
+            p.velocity = velocity;
+            p.version += 1;
+        }
+    }
+
+    fn apply_hyperbola_velocity(&mut self) {
+        if let (Some(a), Some(h)) = (self.active, &self.hyperbola) {
+            self.profiles[a].velocity = h.velocity;
+            self.profiles[a].version += 1;
+        }
+    }
+
+    pub fn import_manual_grid(&mut self, text: &str, name: &str) -> Result<(), String> {
+        let grid = ManualGrid::parse(text, name)?;
+        for p in &mut self.profiles {
+            p.manual_line = short_label(&p.name).parse::<u32>().ok()
+                .filter(|number| grid.coords_for(*number, p.raw.ntr).is_some());
+            p.manual_coords = p.manual_line.and_then(|number| grid.coords_for(number, p.raw.ntr));
+            p.update_distance();
+            p.version += 1;
+        }
+        self.manual_grid = Some(grid);
+        self.map.fitted = false;
+        Ok(())
+    }
+
+    pub fn assign_manual_line(&mut self, profile_id: u32, line: Option<u32>) {
+        let Some(i) = self.profile_index(profile_id) else { return; };
+        let coords = line.and_then(|number| self.manual_grid.as_ref()?.coords_for(number, self.profiles[i].raw.ntr));
+        let p = &mut self.profiles[i];
+        p.manual_line = if coords.is_some() { line } else { None };
+        p.manual_coords = coords;
+        p.update_distance();
+        p.version += 1;
+        self.map.fitted = false;
+    }
+
+    pub fn clear_manual_grid(&mut self) {
+        self.manual_grid = None;
+        for p in &mut self.profiles {
+            p.manual_line = None;
+            p.manual_coords = None;
+            p.update_distance();
+            p.version += 1;
+        }
+        self.map.fitted = false;
     }
 
     /// A save dialog for an export, starting in the default export folder when one is set.
@@ -341,6 +522,8 @@ impl App {
             selected_pick: None,
             hover: None,
             map: MapState { center: [0.0, 0.0], scale: 1.0, fitted: false, hover_world: None, hover_trace: None },
+            map_mode: MapMode::Gps,
+            manual_grid: None,
             basemaps: Vec::new(),
             basemap_jobs: Vec::new(),
             show_map: true,
@@ -354,7 +537,7 @@ impl App {
             show_pdf: false,
             show_about: false,
             show_header: false,
-            gpkg_opts: crate::gpkg::ExportOptions { profiles: true, markers: true, layers: true, trace_points: false, trace_step: 10, interpolations: true },
+            gpkg_opts: crate::gpkg::ExportOptions { profiles: true, markers: true, layers: true, trace_points: false, trace_step: 10, interpolations: true, raster_value: Default::default() },
             pdf_opts: PdfOptions { a3: false, range: PdfRange::Visible, chunk_m: 20.0, one_to_one: true, all_profiles: false, basemap: true, markers: true, processing: true, title: String::new() },
             status: "Open GPR files with File > Open, or load the demo survey.".into(),
             screenshot,
@@ -373,6 +556,7 @@ impl App {
             topo_shown: HashMap::new(),
             plot_px: [0.0, 0.0],
             fit_one_to_one: Default::default(),
+            scroll_to_active: false,
             show_topo: false,
             saved_snapshot: None,
             remember_projects: true,
@@ -430,6 +614,12 @@ impl App {
         p.id = self.next_id;
         self.next_id += 1;
         let id = p.id;
+        p.manual_active = self.map_mode == MapMode::Manual;
+        if let Some(grid) = &self.manual_grid {
+            p.manual_line = p.manual_line.or_else(|| short_label(&p.name).parse::<u32>().ok()
+                .filter(|number| grid.coords_for(*number, p.raw.ntr).is_some()));
+            p.manual_coords = p.manual_line.and_then(|line| grid.coords_for(line, p.raw.ntr));
+        }
         p.update_coords(&self.project_crs);
         self.views.insert(id, ViewState { tr0: 0.0, tr1: p.proc.ntr as f32, s0: 0.0, s1: p.proc.ns as f32 });
         self.fit_one_to_one.insert(id);
@@ -1272,7 +1462,7 @@ impl App {
     fn gpkg_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_gpkg;
         let mut go = false;
-        let no_gps = self.profiles.iter().filter(|p| !p.has_coords()).count();
+        let no_gps = self.profiles.iter().filter(|p| p.coords.is_empty()).count();
         egui::Window::new("Export GeoPackage").open(&mut open).resizable(false).show(ctx, |ui| {
             ui.label(format!("Coordinate system: {}", self.project_crs.label()));
             ui.checkbox(&mut self.gpkg_opts.profiles, "Profile tracks (lines with acquisition attributes)");
@@ -1283,7 +1473,20 @@ impl App {
                 ui.add(egui::DragValue::new(&mut self.gpkg_opts.trace_step).range(1..=10000));
                 ui.label("traces");
             });
-            ui.checkbox(&mut self.gpkg_opts.interpolations, "Interpolations (cells as points with time, depth, altitude; zone outlines)");
+            let has_interpolation = self.zones.iter().any(|z| z.grid.is_some());
+            let mut raster_checked = has_interpolation && self.gpkg_opts.interpolations;
+            if ui.add_enabled(has_interpolation, egui::Checkbox::new(&mut raster_checked,
+                if has_interpolation { "Interpolations raster" } else { "Interpolations raster (no interpolation yet)" })).changed() {
+                self.gpkg_opts.interpolations = raster_checked;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Value:");
+                egui::ComboBox::from_id_salt("gpkg_raster_value").selected_text(self.gpkg_opts.raster_value.label()).show_ui(ui, |ui| {
+                    for value in [RasterValue::Depth, RasterValue::Time, RasterValue::Altitude] {
+                        ui.selectable_value(&mut self.gpkg_opts.raster_value, value, value.label());
+                    }
+                }).response.on_hover_text("One quantity per raster. Time and altitude remain in the project; export again to another file to include either one.");
+            });
             if no_gps > 0 {
                 ui.colored_label(crate::draw::warn_color(ui), format!("{no_gps} profile(s) have no GPS and are left out of the map layers."));
             }
@@ -1372,19 +1575,7 @@ impl App {
                 Some(LineRow { id: l.id, profile: p.name.clone(), type_name: t.name.clone(), comment: l.comment.clone(), color: hex(t.color), pts })
             })
             .collect();
-        let zones: Vec<ZoneRow> = self
-            .zones
-            .iter()
-            .map(|z| ZoneRow {
-                name: z.name.clone(),
-                pick_type: self.marker_types.get(z.type_idx).map(|t| t.name.clone()).unwrap_or_default(),
-                polygon: z.polygon.clone(),
-                cells: z.grid.as_ref().map(|g| g.cells()).unwrap_or_default(),
-                max_radius_m: z.grid.as_ref().map(|g| g.max_radius_m).unwrap_or(self.interp.max_radius_m),
-                cell_size_m: z.grid.as_ref().map(|g| g.cell_m).unwrap_or(self.interp.cell_m),
-            })
-            .collect();
-        crate::gpkg::export(path, &self.project_crs, &self.gpkg_opts, &profiles, &markers, &lines, &zones)
+        crate::gpkg::export(path, &self.project_crs, &self.gpkg_opts, &profiles, &markers, &lines, &self.zones)
     }
 
     fn pdf_window(&mut self, ctx: &egui::Context) {
@@ -1704,19 +1895,16 @@ impl App {
                     ui.selectable_value(&mut self.y_axis, YAxis::Depth, "Depth");
                 }
                 if let Some(a) = self.active {
-                    let p = &mut self.profiles[a];
-                    let r = ui.add(egui::DragValue::new(&mut p.velocity).speed(0.001).range(0.01..=0.3).prefix("v=").suffix(" m/ns")).on_hover_text("Velocity for depth (0.3 = air, 0.1 = moist soil)");
+                    let mut velocity = self.profiles[a].velocity;
+                    let r = ui.add(egui::DragValue::new(&mut velocity).speed(0.001).range(0.01..=0.3).prefix("v=").suffix(" m/ns")).on_hover_text("Velocity for depth, applied to all profiles (0.3 = air, 0.1 = moist soil)");
                     if r.changed() {
-                        p.version += 1;
+                        self.set_velocity_all(velocity);
                     }
                 }
-                if ui.button("⛶ Fit").clicked() {
-                    if let Some(p) = self.active_profile() {
-                        let (id, ntr, ns) = (p.id, p.proc.ntr as f32, p.proc.ns as f32);
-                        self.views.insert(id, ViewState { tr0: 0.0, tr1: ntr, s0: 0.0, s1: ns });
-                    }
+                if ui.button("⛶ Fit").on_hover_text("Fit the full section on all profiles").clicked() {
+                    self.fit_all_profiles();
                 }
-                if ui.add_enabled(self.profiles.iter().any(Profile::has_coords), egui::Button::new("Orient profiles"))
+                if ui.add_enabled(self.profiles.iter().any(|p| !p.coords.is_empty()), egui::Button::new("Orient profiles"))
                     .on_hover_text("Use GPS direction to show each profile west-to-east or north-to-south; picks and source data stay in acquisition order")
                     .clicked()
                 {
@@ -1730,18 +1918,10 @@ impl App {
                     self.status = format!("Oriented {oriented} profile(s) from GPS; profiles without a clear direction were skipped.");
                 }
                 if ui.add_enabled(self.active_profile().is_some(), egui::Button::new("1x1 ratio"))
-                    .on_hover_text("Whole section height, with the same metres per pixel horizontally (time sections use the toolbar velocity)")
+                    .on_hover_text("Apply 1x1 to all profiles: whole section height, with the same metres per pixel horizontally (time sections use the toolbar velocity)")
                     .clicked()
                 {
-                    if let Some(a) = self.active {
-                        let id = self.profiles[a].id;
-                        let v = self.views.get(&id).cloned();
-                        if let Some(view) = v.and_then(|v| self.one_to_one(a, &v)) {
-                            self.views.insert(id, view);
-                        } else {
-                            self.status = "1x1 ratio needs a known trace spacing, velocity and a visible profile.".into();
-                        }
-                    }
+                    self.one_to_one_all_profiles();
                 }
             });
         });
@@ -1757,12 +1937,13 @@ impl App {
             egui::ScrollArea::vertical().id_salt("plist").max_height(200.0).show(ui, |ui| {
                 for (i, p) in self.profiles.iter().enumerate() {
                     ui.horizontal(|ui| {
-                        let gps = if p.has_coords() { "•" } else { " " };
+                        let gps = if !p.coords.is_empty() { "•" } else { " " };
                         // Long names show their end, where the profile number and channel are.
                         let max = ((ui.available_width() - 70.0) / 6.5).max(10.0) as usize;
                         let chars: Vec<char> = p.name.chars().collect();
                         let shown = if chars.len() > max { format!("…{}", chars[chars.len() - (max - 1)..].iter().collect::<String>()) } else { p.name.clone() };
                         let r = ui.selectable_label(self.active == Some(i), format!("{gps} {shown}")).on_hover_text(format!("{}\n{}\n{} traces x {} samples\n{:.1} m\nGPS: {}", p.name, p.format, p.raw.ntr, p.raw.ns, p.length(), p.gps.as_ref().map(|g| g.source.clone()).unwrap_or("none".into())));
+                        if self.active == Some(i) && self.scroll_to_active { r.scroll_to_me(Some(egui::Align::Center)); }
                         if r.clicked() {
                             self.active = Some(i);
                         }
@@ -1782,6 +1963,7 @@ impl App {
                     demo = ui.button("Load demo survey").clicked();
                 }
             });
+            self.scroll_to_active = false;
             if open_files {
                 self.open_files_dialog();
             }
@@ -1799,17 +1981,20 @@ impl App {
                 self.active = if self.profiles.is_empty() { None } else { Some(i.min(self.profiles.len() - 1)) };
             }
             if let Some(a) = self.active {
+                let mut edited_dx = None;
                 let p = &mut self.profiles[a];
                 ui.horizontal(|ui| {
-                    if ui.checkbox(&mut p.use_gps_distance, "Distance from GPS").on_hover_text("Otherwise traces are spaced by the nominal trace spacing").changed() {
+                    let mut distance_from_coords = p.has_coords() && p.use_gps_distance;
+                    let tip = if p.has_coords() { "Otherwise traces are spaced by the nominal trace spacing" } else { "No GPS for this profile" };
+                    if ui.add_enabled(p.has_coords(), egui::Checkbox::new(&mut distance_from_coords, "Distance from GPS")).on_hover_text(tip).changed() {
+                        p.use_gps_distance = distance_from_coords;
                         p.update_distance();
                     }
                     let r = ui
                         .add(egui::DragValue::new(&mut p.dx).speed(0.0001).range(0.0001..=100.0).max_decimals(6).prefix("dx=").suffix(" m"))
-                        .on_hover_text(if p.dx_user_set { "Trace spacing typed in by hand" } else if p.dx_from_file { "Trace spacing from the data file header" } else { "No spacing in the file: default from the import options" });
+                        .on_hover_text("Trace spacing typed in by hand (applied to all profiles)");
                     if r.changed() {
-                        p.dx_user_set = true;
-                        p.update_distance();
+                        edited_dx = Some(p.dx);
                     }
                 });
                 let can_topo = p.has_topo();
@@ -1827,6 +2012,7 @@ impl App {
                     ui.weak("   (this profile has no varying GPS elevations)");
                 }
                 ui.weak(format!("{} · {} tr · {:.3} ns · {:.1} m", p.format, p.raw.ntr, p.raw.dt, p.length()));
+                if let Some(dx) = edited_dx { self.set_trace_spacing_all(dx); }
             }
             ui.separator();
             ui.heading("Processing sequence");
@@ -1935,10 +2121,7 @@ impl App {
                     cancel = ui.button("Cancel").clicked();
                 });
                 if apply {
-                    if let Some(a) = self.active {
-                        self.profiles[a].velocity = h.velocity;
-                        self.profiles[a].version += 1;
-                    }
+                    self.apply_hyperbola_velocity();
                 }
                 if save {
                     self.save_hyperbola();
@@ -2125,7 +2308,8 @@ impl App {
     fn status_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(self.project_crs.short()).strong()).on_hover_text(self.project_crs.label());
+                if self.map_mode == MapMode::Manual { ui.label(RichText::new("Manual grid").strong()); }
+                else { ui.label(RichText::new(self.project_crs.short()).strong()).on_hover_text(self.project_crs.label()); }
                 ui.separator();
                 self.task_status_ui(ui);
                 if let (Some(p), Some((tr, y))) = (self.active_profile(), self.hover) {
@@ -2144,8 +2328,9 @@ impl App {
                     if si >= 0.0 {
                         s.push_str(&format!("amp {:.1}  ", p.proc.value(tr as usize, si as usize)));
                     }
-                    if let Some(c) = p.coord_at(tr) {
-                        s.push_str(&format!("E {:.2}  N {:.2}  H {:.2}", c[0], c[1], c[2]));
+                    if let Some(c) = point_at(p.map_coords(self.map_mode == MapMode::Manual), tr) {
+                        if self.map_mode == MapMode::Manual { s.push_str(&format!("X {:.2} m  Y {:.2} m", c[0], c[1])); }
+                        else { s.push_str(&format!("E {:.2}  N {:.2}  H {:.2}", c[0], c[1], c[2])); }
                     }
                     ui.monospace(s);
                     ui.separator();
@@ -2301,6 +2486,51 @@ mod one_to_one_tests {
     }
 }
 
+#[cfg(test)]
+mod profile_view_controls_tests {
+    use super::*;
+
+    #[test]
+    fn arrows_select_adjacent_profiles_and_stop_at_ends() {
+        let mut app = App::headless(vec![], None);
+        for n in 0..3 {
+            app.add_profile(Profile::new(format!("line_{n}"), PathBuf::new(), "test", Section::new(500, 1000, 0.1), 0.05));
+        }
+        app.active = Some(1);
+        app.select_adjacent_profile(-1);
+        assert_eq!(app.active, Some(0));
+        app.select_adjacent_profile(-1);
+        assert_eq!(app.active, Some(0));
+        app.select_adjacent_profile(1);
+        assert_eq!(app.active, Some(1));
+        app.select_adjacent_profile(1);
+        app.select_adjacent_profile(1);
+        assert_eq!(app.active, Some(2));
+        assert!(app.scroll_to_active);
+    }
+
+    #[test]
+    fn one_to_one_and_fit_apply_to_every_profile() {
+        let mut app = App::headless(vec![], None);
+        for n in 0..3 {
+            app.add_profile(Profile::new(format!("line_{n}"), PathBuf::new(), "test", Section::new(500, 1000, 0.1), 0.05));
+        }
+        app.plot_px = [400.0, 200.0];
+        app.one_to_one_all_profiles();
+        assert!(app.fit_one_to_one.is_empty());
+        for p in &app.profiles {
+            let view = &app.views[&p.id];
+            assert_eq!((view.s0, view.s1), (0.0, 500.0));
+            assert!(view.tr1 - view.tr0 < 1000.0);
+        }
+        app.fit_all_profiles();
+        for p in &app.profiles {
+            let view = &app.views[&p.id];
+            assert_eq!((view.tr0, view.tr1, view.s0, view.s1), (0.0, 1000.0, 0.0, 500.0));
+        }
+    }
+}
+
 fn spectrum_plot(ui: &mut egui::Ui, spec: &[(f32, f32)], step: &Step) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(380.0, 130.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -2344,6 +2574,12 @@ impl eframe::App for App {
         }
         self.poll_jobs(ctx);
         self.pump_tasks(ctx);
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+            self.select_adjacent_profile(-1);
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+            self.select_adjacent_profile(1);
+        }
         self.menu_bar(ctx);
         self.toolbar(ctx);
         self.status_bar(ctx);

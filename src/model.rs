@@ -68,6 +68,99 @@ pub struct GpsTrack {
     pub fixes: Vec<GpsFix>,
 }
 
+pub fn point_at(coords: &[[f64; 3]], trace: f32) -> Option<[f64; 3]> {
+    if coords.is_empty() { return None; }
+    let n = coords.len();
+    let t = trace.clamp(0.0, (n - 1) as f32);
+    let i = t.floor() as usize;
+    let f = (t - i as f32) as f64;
+    let a = coords[i];
+    let b = coords[(i + 1).min(n - 1)];
+    Some([a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f])
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ManualLine {
+    pub number: u32,
+    pub length_m: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ManualGrid {
+    pub source_file: String,
+    pub mode: String,
+    pub size_x_m: f64,
+    pub size_y_m: f64,
+    pub spacing_x_m: f64,
+    pub spacing_y_m: f64,
+    pub lines: Vec<ManualLine>,
+}
+
+pub fn decode_proceq_text(bytes: &[u8]) -> Result<String, String> {
+    if let Some((body, little_endian)) = bytes.strip_prefix(&[0xff, 0xfe]).map(|b| (b, true))
+        .or_else(|| bytes.strip_prefix(&[0xfe, 0xff]).map(|b| (b, false))) {
+        let mut chunks = body.chunks_exact(2);
+        let units: Vec<u16> = chunks.by_ref().map(|pair| {
+            if little_endian { u16::from_le_bytes([pair[0], pair[1]]) }
+            else { u16::from_be_bytes([pair[0], pair[1]]) }
+        }).collect();
+        if !chunks.remainder().is_empty() {
+            return Err("Proceq CSV has an incomplete UTF-16 character".into());
+        }
+        return String::from_utf16(&units).map_err(|_| "Proceq CSV has invalid UTF-16 text".into());
+    }
+    let body = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    std::str::from_utf8(body).map(str::to_owned).map_err(|_| "Proceq CSV is neither UTF-8 nor BOM-marked UTF-16".into())
+}
+
+impl ManualGrid {
+    pub fn parse(text: &str, source_file: &str) -> Result<Self, String> {
+        let mut grid = Self { source_file: source_file.into(), mode: String::new(), size_x_m: 0.0, size_y_m: 0.0, spacing_x_m: 0.0, spacing_y_m: 0.0, lines: Vec::new() };
+        let mut scan = false;
+        let mut user_info = false;
+        for row in text.lines() {
+            let fields: Vec<&str> = row.trim().split('\t').map(str::trim).filter(|s| !s.is_empty()).collect();
+            if fields.is_empty() { continue; }
+            let key = fields[0].to_ascii_lowercase();
+            if key == "user info" { user_info = true; scan = false; continue; }
+            if key == "settings" { user_info = false; scan = false; continue; }
+            if key.contains("scan distance") { user_info = false; scan = true; continue; }
+            if user_info { continue; }
+            let value = fields.get(1).copied().unwrap_or("");
+            let decimal = || value.replace(',', ".").parse::<f64>().ok().filter(|v| v.is_finite());
+            if key == "mode" { grid.mode = value.into(); }
+            else if key.contains("grid size") && key.contains('x') { grid.size_x_m = decimal().unwrap_or(0.0) / 100.0; }
+            else if key.contains("grid size") && key.contains('y') { grid.size_y_m = decimal().unwrap_or(0.0) / 100.0; }
+            else if key.contains("grid spacing") && key.contains('x') { grid.spacing_x_m = decimal().unwrap_or(0.0) / 100.0; }
+            else if key.contains("grid spacing") && key.contains('y') { grid.spacing_y_m = decimal().unwrap_or(0.0) / 100.0; }
+            else if scan && key.starts_with("line ") {
+                let words: Vec<&str> = fields[0].split_whitespace().collect();
+                let number = words.get(1).and_then(|s| s.parse::<u32>().ok());
+                let length = fields.get(1).copied().or_else(|| words.get(2).copied()).unwrap_or("").replace(',', ".").parse::<f64>().ok();
+                if let (Some(number), Some(length_m)) = (number, length.filter(|v| v.is_finite() && *v >= 0.0)) {
+                    grid.lines.push(ManualLine { number, length_m });
+                }
+            }
+        }
+        for (label, value) in [("Grid Size X", grid.size_x_m), ("Grid Size Y", grid.size_y_m), ("Grid Spacing X", grid.spacing_x_m), ("Grid Spacing Y", grid.spacing_y_m)] {
+            if value <= 0.0 { return Err(format!("Not a Proceq area-scan CSV: {label} is missing or invalid")); }
+        }
+        if !grid.mode.is_empty() && !grid.mode.to_ascii_lowercase().contains("area") {
+            return Err("Not a Proceq area-scan CSV: Mode is not Area Scan".into());
+        }
+        if grid.size_x_m / grid.spacing_x_m > 2000.0 || grid.size_y_m / grid.spacing_y_m > 2000.0 {
+            return Err("Not a Proceq area-scan CSV: grid spacing is too fine".into());
+        }
+        Ok(grid)
+    }
+
+    pub fn coords_for(&self, number: u32, ntr: usize) -> Option<Vec<[f64; 3]>> {
+        // shortcut: scans run along X; add the transposed case when a Proceq file supplies Y direction.
+        let (order, line) = self.lines.iter().enumerate().find(|(_, line)| line.number == number && line.length_m > 0.0)?;
+        Some((0..ntr).map(|i| [i as f64 * line.length_m / ntr.saturating_sub(1).max(1) as f64, order as f64 * self.spacing_y_m, 0.0]).collect())
+    }
+}
+
 pub struct Profile {
     pub id: u32,
     pub name: String,
@@ -88,6 +181,9 @@ pub struct Profile {
     pub embedded_gps: Option<GpsTrack>,
     /// Per-trace coordinates in the project CRS (empty without GPS).
     pub coords: Vec<[f64; 3]>,
+    pub manual_coords: Option<Vec<[f64; 3]>>,
+    pub manual_line: Option<u32>,
+    pub manual_active: bool,
     /// Per-trace distance along the profile (m).
     pub dist: Vec<f64>,
     /// Horizontal GPS chainage, independent of the chosen display distance calibration.
@@ -127,6 +223,9 @@ impl Profile {
             gps: None,
             embedded_gps: None,
             coords: Vec::new(),
+            manual_coords: None,
+            manual_line: None,
+            manual_active: false,
             dist: Vec::new(),
             horizontal_dist: Vec::new(),
             use_gps_distance: true,
@@ -138,7 +237,11 @@ impl Profile {
     }
 
     pub fn has_coords(&self) -> bool {
-        !self.coords.is_empty()
+        !self.coords.is_empty() || self.manual_coords.as_ref().is_some_and(|c| !c.is_empty())
+    }
+
+    pub fn map_coords(&self, manual: bool) -> &[[f64; 3]] {
+        if manual { self.manual_coords.as_deref().unwrap_or(&[]) } else { &self.coords }
     }
 
     /// Orient the dominant track direction west-to-east or north-to-south.
@@ -210,9 +313,20 @@ impl Profile {
             // A degenerate track (no movement) falls back to the nominal spacing.
             if acc.is_finite() && acc > 0.0 { self.horizontal_dist = d; }
         }
-        if self.use_gps_distance && !self.horizontal_dist.is_empty() {
-            self.dist = self.horizontal_dist.clone();
-            return;
+        if self.use_gps_distance {
+            let manual = self.manual_coords.as_deref().filter(|c| c.len() == n);
+            let chosen = if self.manual_active || self.coords.is_empty() { manual } else { None };
+            if let Some(coords) = chosen {
+                let mut d = Vec::with_capacity(n);
+                d.push(0.0);
+                for i in 1..n {
+                    let a = coords[i - 1];
+                    let b = coords[i];
+                    d.push(d[i - 1] + (b[0] - a[0]).hypot(b[1] - a[1]));
+                }
+                if d.last().is_some_and(|v| v.is_finite() && *v > 0.0) { self.dist = d; return; }
+            }
+            if !self.horizontal_dist.is_empty() { self.dist = self.horizontal_dist.clone(); return; }
         }
         self.dist = (0..n).map(|i| i as f64 * self.dx as f64).collect();
     }
@@ -332,16 +446,7 @@ impl Profile {
     }
 
     pub fn coord_at(&self, trace: f32) -> Option<[f64; 3]> {
-        if self.coords.is_empty() {
-            return None;
-        }
-        let n = self.coords.len();
-        let t = trace.clamp(0.0, (n - 1) as f32);
-        let i = t.floor() as usize;
-        let f = (t - i as f32) as f64;
-        let a = self.coords[i];
-        let b = self.coords[(i + 1).min(n - 1)];
-        Some([a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f])
+        point_at(&self.coords, trace)
     }
 
     /// Elevations usable for a topographic display (GPS heights that vary).
@@ -546,6 +651,117 @@ pub fn short_label(name: &str) -> String {
         start -= 1;
     }
     chars[start..end].iter().collect()
+}
+
+#[cfg(test)]
+mod manual_grid_tests {
+    use super::*;
+
+    // Matches the Proceq Export Format Version 2 layout. Personal values are fictitious.
+    const CSV: &str = "Export Format Version\t2\r\n\
+Export App Version\t6.0.0\r\n\
+USER INFO\r\n\
+User\tPrivate Example\r\n\
+Email\tprivate@example.invalid\r\n\
+Probe S/N\tTEST-0001\r\n\
+Hardware Version\tB0\r\n\
+Firmware Version\t5.7.3\r\n\
+App Version\t6.0.0\r\n\
+Contract ID\tTEST-ID\r\n\
+MAC Address\t00:00:00:00:00:00\r\n\
+\r\n\
+\r\n\
+SETTINGS\r\n\
+Measuring Presets\r\n\
+File Name\tdoor3d10cmgrid001\r\n\
+File ID\tTEST-FILE-ID\r\n\
+Folder\tst.Christophe\r\n\
+Mode\tArea Scan\r\n\
+Grid Size - X [cm]\t160.0\r\n\
+Grid Size - Y [cm]\t120.0\r\n\
+Grid Spacing - X [cm]\t10.0\r\n\
+Grid Spacing - Y [cm]\t10.0\r\n\
+Scan\t14\r\n\
+Units\tMetric\r\n\
+Resolution\tMax Depth\r\n\
+Repetition Rate [scans /cm]\t1.0\r\n\
+Scan Length [samples / scan]\t409.000000\r\n\
+Time Window [ns]\t28\r\n\
+Sampling Rate [GHz]\t20.48\r\n\
+Antenna Spacing [cm]\t7.2\r\n\
+\r\n\
+\r\n\
+SCAN DISTANCE [m]\r\n\
+Line 1\t0.00\r\n\
+Line 18\t1.60\r\n\
+Line 19\t1.60\r\n\
+Line 20\t1.60\r\n\
+Line 21\t1.60\r\n\
+Line 22\t1.60\r\n\
+Line 23\t1.60\r\n\
+Line 24\t1.60\r\n\
+Line 25\t1.60\r\n\
+Line 26\t1.60\r\n\
+Line 27\t1.60\r\n\
+Line 28\t1.60\r\n\
+Line 29\t1.60\r\n\
+Line 30\t1.60\r\n";
+
+    #[test]
+    fn parses_proceq_area_scan_without_user_info() {
+        let g = ManualGrid::parse(CSV, "scan.csv").unwrap();
+        assert_eq!(g.source_file, "scan.csv");
+        assert_eq!(g.mode, "Area Scan");
+        assert_eq!((g.size_x_m, g.size_y_m), (1.6, 1.2));
+        assert!((g.spacing_x_m - 0.1).abs() < 1e-9);
+        assert!((g.spacing_y_m - 0.1).abs() < 1e-9);
+        assert_eq!(g.lines.len(), 14);
+        assert_eq!(g.lines.iter().map(|line| line.number).collect::<Vec<_>>(), [1, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]);
+        assert_eq!(g.lines[0].length_m, 0.0);
+        assert!(g.lines[1..].iter().all(|line| line.length_m == 1.6));
+        assert!(!serde_json::to_string(&g).unwrap().contains("Private Example"));
+        assert!(!serde_json::to_string(&g).unwrap().contains("private@example.invalid"));
+        assert!(g.coords_for(1, 17).is_none());
+    }
+
+    #[test]
+    fn placed_profile_uses_file_order_and_scan_length() {
+        let g = ManualGrid::parse(CSV, "scan.csv").unwrap();
+        let mut p = Profile::new("Profile_018".into(), PathBuf::new(), "demo", Section::new(5, 17, 0.1), 0.05);
+        p.manual_coords = g.coords_for(18, p.raw.ntr);
+        p.manual_active = true;
+        p.update_distance();
+        let c = p.manual_coords.as_ref().unwrap();
+        assert_eq!(c.len(), 17);
+        assert_eq!(c[0], [0.0, 0.1, 0.0]);
+        assert_eq!(c[16], [1.6, 0.1, 0.0]);
+        assert!((p.dist[16] - 1.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rejects_missing_grid_size() {
+        let csv = "Mode\tArea Scan\nGrid Spacing - X [cm]\t10\nGrid Spacing - Y [cm]\t10\n";
+        assert!(ManualGrid::parse(csv, "bad.csv").unwrap_err().contains("Grid Size X"));
+    }
+
+    #[test]
+    fn accepts_comma_decimals_in_export() {
+        let csv = CSV.replace("160.0", "160,0").replace("1.60", "1,60");
+        let g = ManualGrid::parse(&csv, "scan.csv").unwrap();
+        assert_eq!(g.size_x_m, 1.6);
+        assert_eq!(g.lines[1].length_m, 1.6);
+    }
+
+    #[test]
+    fn reads_utf16_le_proceq_export() {
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in CSV.encode_utf16() { bytes.extend_from_slice(&unit.to_le_bytes()); }
+        let text = decode_proceq_text(&bytes).unwrap();
+        let g = ManualGrid::parse(&text, "survey.csv").unwrap();
+        assert_eq!((g.size_x_m, g.size_y_m), (1.6, 1.2));
+        assert_eq!(g.lines.len(), 14);
+        assert_eq!(g.lines[1].number, 18);
+    }
 }
 
 #[cfg(test)]

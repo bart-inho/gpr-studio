@@ -13,6 +13,14 @@ picking, mapping and reporting. Written in Rust with egui; runs on Windows, macO
   GeoTIFF basemaps of any size, any output coordinate system (EPSG code or PROJ string; default EPSG:2056).
   The map sits on the right, at the bottom of the main window (full width for long profiles) or in its own
   window (buttons in the map header, or the Map menu); the choice is kept for the next start.
+  The map header can switch to **Manual projection** for a local Proceq area-scan grid. Import a tab-separated
+  `.csv`/`.txt` file (UTF-8 or BOM-marked UTF-16, as in Proceq exports) with `Mode`,
+  `Grid Size - X/Y [cm]`, `Grid Spacing - X/Y [cm]`, and a
+  `SCAN DISTANCE [m]` section of `Line N` plus scanned length. Lines run along X; their Y positions follow
+  file order, while Proceq line numbers match profile names or can be assigned in the map panel. Zero-length
+  lines have no profile. The project saves the grid values, source file name, assignments and map mode, but no
+  `USER INFO` or CSV path. GPS coordinates and the project CRS remain separate. Manual coordinates are not
+  exported to GeoPackage; that export continues to use GPS coordinates.
   **Interpolation zones** (left panel, under Picks): *New zone* draws a polygon on the map (left click adds a
   vertex, a drag still pans, right click or Enter closes, Esc cancels); *Interpolate* fills it with an
   inverse-distance-weighted surface of one layer-pick type, shown as a Jet-coloured depth raster with a legend.
@@ -22,22 +30,30 @@ picking, mapping and reporting. Written in Rust with egui; runs on Windows, macO
   divergence compensation, trace normalisation (90th percentile of absolute amplitude per trace), running (moving) average over traces, average xy-filter,
   diffraction stack, flat and topographic Kirchhoff migration, FK (Stolt) migration, time-depth conversion. Runs in the background
   with a progress bar; sequences can be applied to all profiles.
-- **Data view** – distance in metres from the file's trace spacing (or GPS); "Show topography" lets time
+- **Data view** – distance in metres from the file's trace spacing, GPS or manual grid. Editing `dx` applies
+  that nominal spacing to every loaded profile. Editing toolbar `v` likewise sets the velocity for every
+  loaded profile; **Use v for profile** after a hyperbola fit calibrates just that profile.
+  "Show topography" lets time
   zero follow the GPS elevation (velocity from the toolbar) with an elevation axis. The main wheel scrolls
   vertically; the side wheel slides along the profile. Shift + wheel crops the time axis from 0,
   Ctrl + wheel zooms horizontally (short profiles are drawn narrower at the same scale, never stretched).
+  Up and Down select the previous and next profile. **Fit** shows the full section on every loaded profile.
   **Orient profiles**, next to Fit, uses GPS to display each profile west-to-east or north-to-south
   along its dominant direction. Source traces and pick indices remain in acquisition order; the
-  display direction is saved in the project. **1x1 ratio** always shows the whole height of the section and
+  display direction is saved in the project. **1x1 ratio** applies to every loaded profile, shows the whole height of each section and
   only changes the horizontal span (around the current centre) so that one metre is as long horizontally
   as vertically; time sections use the toolbar velocity. A profile too short to fill the width is drawn narrower.
 - **Picking** – typed point markers, hyperbola velocity fitting, layer lines with phase following and snapping; Ctrl+Z undoes picking steps and deletions.
   **Show crossing picks** (on by default): where another profile crosses this one, its layer picks appear as a dot
   labelled `p<profile number>` at the same depth (hover for the profile, pick and depth). Interpolated zones are
   drawn on every profile they cover as a pink dashed line. Both are read-only.
-- **Export** – GeoPackage (profiles, markers, layer picks, trace points, interpolation cells as points with
-  time/depth/altitude and the zone outlines), SEG-Y of chosen processing steps,
+- **Export** – GeoPackage (GPS profiles, markers, layer picks, optional trace points and layer vertices,
+  plus one Float32 interpolations raster), SEG-Y of chosen processing steps,
   PDF report (the top three quarters for the radargram, with optional exact 1×1 metre scale and a minimum section width; the bottom quarter split equally between the whole-survey map, profile details, and processing), CSV of picks.
+  The GeoPackage **Interpolations raster** stores Depth (m), Time (ns), or Altitude (m), chosen in
+  the export dialog. Export again to a different file for another quantity; the others remain in the
+  project. Empty cells and tile padding use NoData `-9999` and appear transparent. A projected CRS
+  in metres is required; vector export still succeeds when the raster is skipped for a geographic CRS.
 - **Projects** – `.gprproj` files keep the file list, processing, GPS, picks, CRS and basemaps.
   Ctrl+S saves to the project's file, File › Open last project reopens the previous one, and closing only
   asks to save when something changed. Files inside the project's folder are stored with relative paths;

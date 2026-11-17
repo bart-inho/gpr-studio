@@ -182,7 +182,7 @@ impl App {
                     p.proc.dt,
                     if p.proc.depth_axis { "m" } else { "ns" },
                     p.axis_length(),
-                    if p.has_coords() { " · GPS" } else { " · no GPS" }
+                    if p.manual_active && p.manual_coords.is_some() { " · manual grid" } else if !p.coords.is_empty() { " · GPS" } else { " · no GPS" }
                 ));
                 let ed = p.steps.iter().filter(|e| e.enabled).count();
                 if ed > 0 {
@@ -401,7 +401,8 @@ impl App {
             painter.text(Pos2::new(x, plot.bottom() + 7.0), Align2::CENTER_TOP, fmt_tick(d, step), font.clone(), axis_col);
             d += step;
         }
-        painter.text(Pos2::new(plot.center().x, plot.bottom() + 22.0), Align2::CENTER_TOP, if migrated { "horizontal distance [m] (GPS)" } else if p.use_gps_distance && p.has_coords() { "distance [m] (GPS)" } else { "distance [m]" }, font.clone(), axis_col);
+        let manual_distance = p.use_gps_distance && p.manual_coords.is_some() && (p.manual_active || p.coords.is_empty());
+        painter.text(Pos2::new(plot.center().x, plot.bottom() + 22.0), Align2::CENTER_TOP, if migrated { "horizontal distance [m] (GPS)" } else if manual_distance { "distance [m] (manual)" } else if p.use_gps_distance && !p.coords.is_empty() { "distance [m] (GPS)" } else { "distance [m]" }, font.clone(), axis_col);
         // Distance in metres on top as well (trace numbers are in the status bar).
         let mut d = (d0 / step).ceil() * step;
         while d <= d1 + 1e-9 {
@@ -412,7 +413,7 @@ impl App {
             }
             d += step;
         }
-        let src = if migrated || p.use_gps_distance && p.has_coords() { "from GPS".to_string() } else { format!("trace spacing {} m", format!("{:.6}", p.dx).trim_end_matches('0').trim_end_matches('.')) };
+        let src = if migrated { "from GPS".to_string() } else if manual_distance { "from manual grid".to_string() } else if p.use_gps_distance && !p.coords.is_empty() { "from GPS".to_string() } else { format!("trace spacing {} m", format!("{:.6}", p.dx).trim_end_matches('0').trim_end_matches('.')) };
         painter.text(Pos2::new(plot.left(), avail.top() + 2.0), Align2::LEFT_TOP, format!("distance [m] · {src}"), font.clone(), ui.visuals().weak_text_color());
 
         // ---------------------------------------------------------- picks overlay
@@ -450,7 +451,7 @@ impl App {
             }
         }
         // Interpolation surfaces sampled under this profile (read-only, pink).
-        if p.has_coords() {
+        if !p.coords.is_empty() {
             let n = (plot.width() / 2.0).max(2.0) as usize;
             let (ta, tb) = (view.tr0.max(0.0), view.tr1.min(ntr - 1.0));
             for z in self.zones.iter().filter(|z| z.visible) {

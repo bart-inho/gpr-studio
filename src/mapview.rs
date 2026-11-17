@@ -1,8 +1,9 @@
 //! The GPS map: basemaps, profile tracks, the visible section and markers.
 
-use crate::app::App;
+use crate::app::{App, MapMode};
 use crate::basemap::{self, Detail, GRID};
 use crate::draw::{self, c32, nice_step};
+use crate::model::decode_proceq_text;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke};
 
 pub const SECTION_COLOR: Color32 = Color32::from_rgb(255, 140, 0);
@@ -15,6 +16,15 @@ impl App {
     }
 
     fn fit_map(&mut self, rect: Rect) {
+        if self.map_mode == MapMode::Manual {
+            if let Some(g) = &self.manual_grid {
+                self.map.center = [g.size_x_m / 2.0, g.size_y_m / 2.0];
+                self.map.scale = (g.size_x_m / rect.width().max(1.0) as f64)
+                    .max(g.size_y_m / rect.height().max(1.0) as f64) * 1.2;
+                self.map.fitted = true;
+            }
+            return;
+        }
         let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for p in &self.profiles {
             for c in &p.coords {
@@ -52,20 +62,78 @@ impl App {
         self.map.fitted = true;
     }
 
+    fn manual_grid_ui(&mut self, ui: &mut egui::Ui) {
+        let mut clear = false;
+        let mut assignments = Vec::new();
+        egui::CollapsingHeader::new("Manual projection").default_open(true).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Import Proceq CSV…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new().add_filter("Proceq CSV", &["csv", "txt"]).pick_file() {
+                        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("survey.csv");
+                        self.status = match std::fs::read(&path) {
+                            Ok(bytes) => match decode_proceq_text(&bytes) {
+                                Ok(text) => match self.import_manual_grid(&text, name) {
+                                    Ok(()) => format!("Imported Proceq grid from {name}."),
+                                    Err(e) => e,
+                                },
+                                Err(e) => e,
+                            },
+                            Err(e) => format!("Could not read Proceq CSV: {e}"),
+                        };
+                    }
+                }
+                if ui.add_enabled(self.manual_grid.is_some(), egui::Button::new("Clear")).clicked() { clear = true; }
+            });
+            if let Some(g) = &self.manual_grid {
+                ui.label(format!("{} · {} · {:.2} × {:.2} m · spacing {:.2} × {:.2} m · {} lines", g.source_file, g.mode, g.size_x_m, g.size_y_m, g.spacing_x_m, g.spacing_y_m, g.lines.len()));
+                let expected = (g.size_y_m / g.spacing_y_m).round() as usize + 1;
+                if g.lines.len() != expected { ui.colored_label(Color32::from_rgb(190, 110, 20), format!("Grid suggests {expected} lines; CSV lists {}.", g.lines.len())); }
+                let empty = g.lines.iter().filter(|line| line.length_m == 0.0).count();
+                if empty > 0 { ui.colored_label(Color32::from_rgb(190, 110, 20), format!("{empty} line(s) have zero scan length and no profile.")); }
+                egui::ScrollArea::vertical().max_height(110.0).show(ui, |ui| {
+                    for p in &self.profiles {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{} →", p.name));
+                            let mut selected = p.manual_line;
+                            egui::ComboBox::from_id_salt(("manual_line", p.id)).selected_text(selected.map(|n| format!("Line {n}")).unwrap_or_else(|| "not placed".into())).show_ui(ui, |ui| {
+                                ui.selectable_value(&mut selected, None, "not placed");
+                                for line in &g.lines {
+                                    ui.add_enabled_ui(line.length_m > 0.0, |ui| {
+                                        ui.selectable_value(&mut selected, Some(line.number), format!("Line {} · {:.2} m", line.number, line.length_m));
+                                    });
+                                }
+                            });
+                            if selected != p.manual_line { assignments.push((p.id, selected)); }
+                        });
+                    }
+                });
+            } else {
+                ui.weak("Import an area-scan CSV to place profiles on a local grid.");
+            }
+        });
+        if clear { self.clear_manual_grid(); }
+        else { for (id, line) in assignments { self.assign_manual_line(id, line); } }
+    }
+
     pub fn map_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.strong("GPS tracks");
+            let mut mode = self.map_mode;
+            egui::ComboBox::from_id_salt("map_mode").selected_text(match mode { MapMode::Gps => "GPS tracks", MapMode::Manual => "Manual projection" }).show_ui(ui, |ui| {
+                ui.selectable_value(&mut mode, MapMode::Gps, "GPS tracks");
+                ui.selectable_value(&mut mode, MapMode::Manual, "Manual projection");
+            });
+            if mode != self.map_mode { self.set_map_mode(mode); }
             if ui.small_button("Fit").clicked() {
                 self.map.fitted = false;
             }
-            if ui.small_button("+ GeoTIFF").on_hover_text("Add a GeoTIFF basemap (any size)").clicked() {
+            if ui.add_enabled(self.map_mode == MapMode::Gps, egui::Button::new("+ GeoTIFF")).on_hover_text("Add a GeoTIFF basemap (any size)").clicked() {
                 if let Some(fs) = rfd::FileDialog::new().add_filter("GeoTIFF", &["tif", "tiff", "TIF", "TIFF"]).pick_files() {
                     for f in fs {
                         self.add_basemap(f);
                     }
                 }
             }
-            if ui.small_button(self.project_crs.short()).on_hover_text(format!("{}\nClick to change the output coordinate system", self.project_crs.label())).clicked() {
+            if ui.add_enabled(self.map_mode == MapMode::Gps, egui::Button::new(self.project_crs.short())).on_hover_text(format!("{}\nClick to change the output coordinate system", self.project_crs.label())).clicked() {
                 self.show_crs = true;
             }
             use crate::app::MapPlacement;
@@ -75,7 +143,9 @@ impl App {
                 }
             }
         });
-        if !self.basemaps.is_empty() {
+        let manual = self.map_mode == MapMode::Manual;
+        if manual { self.manual_grid_ui(ui); }
+        if !manual && !self.basemaps.is_empty() {
             egui::CollapsingHeader::new(format!("Basemaps ({})", self.basemaps.len())).default_open(false).show(ui, |ui| {
                 let mut remove = None;
                 let crs_list: Vec<String> = self.basemaps.iter().map(|b| b.crs.short()).collect();
@@ -133,7 +203,7 @@ impl App {
                 self.map.center[1] = wy + (hp.y - rect.center().y) as f64 * self.map.scale;
             }
         }
-        let drawing = self.zone_draw.is_some();
+        let drawing = !manual && self.zone_draw.is_some();
         if resp.double_clicked() && !drawing {
             self.map.fitted = false;
         }
@@ -161,10 +231,39 @@ impl App {
         let (map_bg, text, weak) = if dark { (Color32::from_rgb(40, 42, 38), Color32::from_gray(230), Color32::from_gray(190)) } else { (Color32::from_rgb(236, 238, 232), Color32::BLACK, Color32::from_gray(60)) };
         painter.rect_filled(rect, 0.0, map_bg);
 
+        if let Some(g) = self.manual_grid.as_ref().filter(|_| manual) {
+            let outline = Rect::from_two_pos(to_s(0.0, g.size_y_m), to_s(g.size_x_m, 0.0));
+            painter.rect_stroke(outline, 0.0, Stroke::new(1.2_f32, weak), egui::StrokeKind::Middle);
+            let grid_color = Color32::from_gray(if dark { 85 } else { 195 });
+            for i in 1..=(g.size_x_m / g.spacing_x_m).floor() as usize {
+                let x = i as f64 * g.spacing_x_m;
+                if x < g.size_x_m { painter.line_segment([to_s(x, 0.0), to_s(x, g.size_y_m)], Stroke::new(0.6_f32, grid_color)); }
+            }
+            for i in 1..=(g.size_y_m / g.spacing_y_m).floor() as usize {
+                let y = i as f64 * g.spacing_y_m;
+                if y < g.size_y_m { painter.line_segment([to_s(0.0, y), to_s(g.size_x_m, y)], Stroke::new(0.6_f32, grid_color)); }
+            }
+            let tick = nice_step(g.size_x_m.max(g.size_y_m), 4.0);
+            let mut x = 0.0;
+            while x <= g.size_x_m + 1e-9 {
+                painter.text(to_s(x, 0.0) + egui::vec2(0.0, 5.0), Align2::CENTER_TOP, format!("{x:.1}"), FontId::proportional(9.0), weak);
+                x += tick;
+            }
+            let mut y = tick;
+            while y <= g.size_y_m + 1e-9 {
+                painter.text(to_s(0.0, y) + egui::vec2(-5.0, 0.0), Align2::RIGHT_CENTER, format!("{y:.1}"), FontId::proportional(9.0), weak);
+                y += tick;
+            }
+            for (order, line) in g.lines.iter().enumerate() {
+                let y = order as f64 * g.spacing_y_m;
+                painter.text(to_s(0.0, y) + egui::vec2(-5.0, -7.0), Align2::RIGHT_CENTER, format!("Line {}", line.number), FontId::proportional(9.0), text);
+            }
+        }
+
         // ---------------------------------------------------------- basemaps
         let project = self.project_crs.clone();
         let ctx = ui.ctx().clone();
-        for b in self.basemaps.iter_mut() {
+        for b in self.basemaps.iter_mut().filter(|_| !manual) {
             if !b.visible {
                 continue;
             }
@@ -250,7 +349,7 @@ impl App {
         }
 
         // ---------------------------------------------------------- interpolation zones
-        for z in self.zones.iter().filter(|z| z.visible) {
+        for z in self.zones.iter().filter(|z| !manual && z.visible) {
             if let Some(g) = &z.grid {
                 if self.zone_tex.get(&z.id).map(|t| t.0 != z.rev).unwrap_or(true) {
                     let ci = egui::ColorImage::from_rgba_unmultiplied([g.nx, g.ny], &g.rgba());
@@ -273,12 +372,13 @@ impl App {
         let hp = resp.hover_pos();
         let mut drawn_labels: Vec<(String, Pos2)> = Vec::new();
         for p in &self.profiles {
-            if p.coords.len() < 2 {
+            let coords = p.map_coords(manual);
+            if coords.len() < 2 {
                 continue;
             }
-            let n = p.coords.len();
+            let n = coords.len();
             let step = (n / 3000).max(1);
-            let pts: Vec<Pos2> = p.coords.iter().step_by(step).chain(std::iter::once(&p.coords[n - 1])).map(|c| to_s(c[0], c[1])).collect();
+            let pts: Vec<Pos2> = coords.iter().step_by(step).chain(std::iter::once(&coords[n - 1])).map(|c| to_s(c[0], c[1])).collect();
             let is_active = Some(p.id) == active_id;
             if is_active {
                 painter.add(egui::Shape::line(pts.clone(), Stroke::new(4.5_f32, Color32::WHITE)));
@@ -288,7 +388,7 @@ impl App {
                     let b = (v.tr1.ceil() as usize).min(n);
                     if b > a + 1 {
                         let st = ((b - a) / 2000).max(1);
-                        let sp: Vec<Pos2> = p.coords[a..b].iter().step_by(st).chain(std::iter::once(&p.coords[b - 1])).map(|c| to_s(c[0], c[1])).collect();
+                        let sp: Vec<Pos2> = coords[a..b].iter().step_by(st).chain(std::iter::once(&coords[b - 1])).map(|c| to_s(c[0], c[1])).collect();
                         painter.add(egui::Shape::line(sp.clone(), Stroke::new(9.0_f32, SECTION_COLOR)));
                         for e in [sp[0], *sp.last().unwrap()] {
                             painter.circle_filled(e, 5.0, SECTION_COLOR);
@@ -323,7 +423,7 @@ impl App {
             }
             // Hover: nearest trace
             if let Some(h) = hp {
-                for (i, c) in p.coords.iter().enumerate().step_by(((n / 4000).max(1)) as usize) {
+                for (i, c) in coords.iter().enumerate().step_by((n / 4000).max(1)) {
                     let d = to_s(c[0], c[1]).distance(h);
                     if d < 12.0 && hover_best.map(|b| d < b.0).unwrap_or(true) {
                         hover_best = Some((d, p.id, i as f32));
@@ -335,17 +435,17 @@ impl App {
         for l in &self.lines {
             let Some(p) = self.profiles.iter().find(|p| p.id == l.profile_id) else { continue };
             let Some(t) = self.marker_types.get(l.type_idx) else { continue };
-            if !p.has_coords() {
+            if p.map_coords(manual).is_empty() {
                 continue;
             }
-            let pts: Vec<Pos2> = l.points.iter().filter_map(|(tr, _)| p.coord_at(*tr)).map(|c| to_s(c[0], c[1])).collect();
+            let pts: Vec<Pos2> = l.points.iter().filter_map(|(tr, _)| crate::model::point_at(p.map_coords(manual), *tr)).map(|c| to_s(c[0], c[1])).collect();
             painter.add(egui::Shape::dashed_line(&pts, Stroke::new(3.0_f32, c32(t.color)), 6.0, 3.0));
         }
         // Markers
         for m in &self.markers {
             let Some(p) = self.profiles.iter().find(|p| p.id == m.profile_id) else { continue };
             let Some(t) = self.marker_types.get(m.type_idx) else { continue };
-            if let Some(c) = p.coord_at(m.trace) {
+            if let Some(c) = crate::model::point_at(p.map_coords(manual), m.trace) {
                 let at = to_s(c[0], c[1]);
                 if rect.expand(10.0).contains(at) {
                     draw::symbol(&painter, at, 5.0, t.symbol, c32(t.color), self.selected_pick == Some(m.id));
@@ -355,7 +455,7 @@ impl App {
         }
         // Cursor from the data view
         if let (Some(p), Some((tr, _))) = (self.active_profile(), self.hover) {
-            if let Some(c) = p.coord_at(tr) {
+            if let Some(c) = crate::model::point_at(p.map_coords(manual), tr) {
                 let at = to_s(c[0], c[1]);
                 painter.circle_filled(at, 5.5, Color32::from_rgb(230, 30, 30));
                 painter.circle_stroke(at, 5.5, Stroke::new(1.5_f32, Color32::WHITE));
@@ -366,7 +466,7 @@ impl App {
         if let Some((_, pid, tr)) = hover_best {
             self.map.hover_trace = Some((pid, tr));
             if let Some(p) = self.profiles.iter().find(|p| p.id == pid) {
-                if let Some(c) = p.coord_at(tr) {
+                if let Some(c) = crate::model::point_at(p.map_coords(manual), tr) {
                     let at = to_s(c[0], c[1]);
                     painter.circle_stroke(at, 7.0, Stroke::new(2.0_f32, Color32::from_rgb(230, 30, 30)));
                     painter.text(at + egui::vec2(10.0, 8.0), Align2::LEFT_TOP, format!("{}  trace {:.0}  {:.1} m", p.name, tr + 1.0, p.dist_at(tr)), FontId::proportional(11.0), text);
@@ -379,7 +479,7 @@ impl App {
         self.map.hover_world = hp.map(to_w);
 
         // Polygon in progress: vertices, edges and a rubber band to the pointer.
-        if let Some((_, pts)) = &self.zone_draw {
+        if let Some((_, pts)) = self.zone_draw.as_ref().filter(|_| !manual) {
             let mut sp: Vec<Pos2> = pts.iter().map(|q| to_s(q[0], q[1])).collect();
             if let Some(h) = hp {
                 sp.push(h);
@@ -392,7 +492,7 @@ impl App {
         }
         // Legend of the interpolations (Jet, min to max depth).
         let mut ly = rect.top() + 64.0;
-        for z in self.zones.iter().filter(|z| z.visible) {
+        for z in self.zones.iter().filter(|z| !manual && z.visible) {
             let Some((lo, hi)) = z.grid.as_ref().and_then(|g| g.depth_range()) else { continue };
             let lr = Rect::from_min_size(Pos2::new(rect.right() - 150.0, ly), egui::vec2(144.0, 40.0));
             painter.rect_filled(lr, 3.0, Color32::from_rgba_unmultiplied(255, 255, 255, 210));
@@ -408,11 +508,13 @@ impl App {
         }
 
         // ---------------------------------------------------------- decorations
-        if self.profiles.iter().all(|p| !p.has_coords()) && self.basemaps.is_empty() {
+        if manual && self.manual_grid.is_none() {
+            painter.text(rect.center(), Align2::CENTER_CENTER, "Import a Proceq area-scan CSV to show the manual grid.", FontId::proportional(13.0), weak);
+        } else if !manual && self.profiles.iter().all(|p| p.coords.is_empty()) && self.basemaps.is_empty() {
             painter.text(rect.center(), Align2::CENTER_CENTER, "No GPS tracks yet.\nImport profiles with GPS, or add a GeoTIFF basemap.", FontId::proportional(13.0), weak);
         }
         // Scale bar
-        let geo = self.is_geographic();
+        let geo = !manual && self.is_geographic();
         let m_per_unit = if geo { 111_320.0 * (cy.to_radians().cos()).max(0.01) } else { 1.0 };
         let target_m = sc * m_per_unit * rect.width() as f64 / 5.0;
         let bar_m = nice_step(target_m, 1.0);
@@ -428,9 +530,9 @@ impl App {
         painter.add(egui::Shape::convex_polygon(vec![na + egui::vec2(0.0, -16.0), na + egui::vec2(7.0, 6.0), na, na + egui::vec2(-7.0, 6.0)], text, Stroke::new(1.0_f32, text)));
         painter.text(na + egui::vec2(0.0, 8.0), Align2::CENTER_TOP, "N", FontId::proportional(12.0), text);
         // CRS and coordinates
-        painter.text(rect.left_top() + egui::vec2(6.0, 4.0), Align2::LEFT_TOP, self.project_crs.label(), FontId::proportional(11.0), weak);
+        painter.text(rect.left_top() + egui::vec2(6.0, 4.0), Align2::LEFT_TOP, if manual { "Manual grid (local, m)".into() } else { self.project_crs.label() }, FontId::proportional(11.0), weak);
         if let Some(w) = self.map.hover_world {
-            let s = if geo { format!("{:.6}°, {:.6}°", w[1], w[0]) } else { format!("E {:.2}  N {:.2}", w[0], w[1]) };
+            let s = if manual { format!("X {:.2} m  Y {:.2} m", w[0], w[1]) } else if geo { format!("{:.6}°, {:.6}°", w[1], w[0]) } else { format!("E {:.2}  N {:.2}", w[0], w[1]) };
             painter.text(rect.right_bottom() - egui::vec2(6.0, 4.0), Align2::RIGHT_BOTTOM, s, FontId::monospace(11.0), text);
         }
         // Legend for the highlight
@@ -439,6 +541,29 @@ impl App {
             painter.line_segment([lp + egui::vec2(0.0, 6.0), lp + egui::vec2(22.0, 6.0)], Stroke::new(7.0_f32, SECTION_COLOR));
             painter.text(lp + egui::vec2(28.0, 6.0), Align2::LEFT_CENTER, "section shown in the data view", FontId::proportional(10.5), weak);
         }
+    }
+}
+
+#[cfg(test)]
+mod manual_map_tests {
+    use super::*;
+
+    #[test]
+    fn manual_fit_uses_grid_not_gps_tracks() {
+        let mut app = App::headless(vec![], None);
+        app.load_demo(false);
+        let csv = "Mode\tArea Scan\nGrid Size - X [cm]\t160\nGrid Size - Y [cm]\t120\nGrid Spacing - X [cm]\t10\nGrid Spacing - Y [cm]\t10\nSCAN DISTANCE [m]\nLine 1\t1.60\n";
+        app.import_manual_grid(csv, "scan.csv").unwrap();
+        app.set_map_mode(MapMode::Manual);
+        app.fit_map(Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 300.0)));
+        assert_eq!(app.map.center, [0.8, 0.6]);
+        assert!(app.map.scale > 0.0 && app.map.scale < 0.01);
+        assert!(app.map.center[1] + app.map.scale * 150.0 >= 1.3);
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0))), ..Default::default() }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.map_ui(ui));
+        });
+        assert!(!output.shapes.is_empty());
     }
 }
 

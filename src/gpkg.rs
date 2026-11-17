@@ -1,8 +1,25 @@
 //! GeoPackage export (OGC GeoPackage 1.2): profiles, point markers, layer picks, trace points and interpolations.
 
 use crate::crs::CrsSpec;
+use crate::interp::{Grid, Zone};
 use rusqlite::{params, Connection};
 use std::path::Path;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RasterValue {
+    #[default]
+    Depth,
+    Time,
+    Altitude,
+}
+
+impl RasterValue {
+    pub fn label(self) -> &'static str { match self { Self::Depth => "Depth (m)", Self::Time => "Time (ns)", Self::Altitude => "Altitude (m)" } }
+    fn field(self) -> &'static str { match self { Self::Depth => "depth_m", Self::Time => "time_ns", Self::Altitude => "altitude_m" } }
+    fn unit(self) -> &'static str { if self == Self::Time { "ns" } else { "m" } }
+    fn quantity(self) -> &'static str { match self { Self::Depth => "depth", Self::Time => "time", Self::Altitude => "altitude" } }
+    fn samples(self, grid: &Grid) -> &[f32] { match self { Self::Depth => &grid.depth_m, Self::Time => &grid.time_ns, Self::Altitude => &grid.altitude_m } }
+}
 
 pub struct ExportOptions {
     pub profiles: bool,
@@ -11,6 +28,7 @@ pub struct ExportOptions {
     pub trace_points: bool,
     pub trace_step: usize,
     pub interpolations: bool,
+    pub raster_value: RasterValue,
 }
 
 pub struct ProfileRow {
@@ -56,16 +74,6 @@ pub struct LineRow {
     pub pts: Vec<[f64; 6]>,
 }
 
-pub struct ZoneRow {
-    pub name: String,
-    pub pick_type: String,
-    pub polygon: Vec<[f64; 2]>,
-    /// Non-empty cells: (x, y, time ns, depth m, altitude m).
-    pub cells: Vec<[f64; 5]>,
-    pub max_radius_m: f64,
-    pub cell_size_m: f64,
-}
-
 fn geom_blob(srs: i32, wkb_type: u32, pts: &[[f64; 3]], z: bool) -> Vec<u8> {
     let mut b = Vec::with_capacity(64 + pts.len() * 24);
     b.extend_from_slice(b"GP");
@@ -108,7 +116,7 @@ fn srs_id(crs: &CrsSpec) -> i32 {
     }
 }
 
-pub fn export(path: &Path, crs: &CrsSpec, opt: &ExportOptions, profiles: &[ProfileRow], markers: &[MarkerRow], lines: &[LineRow], zones: &[ZoneRow]) -> Result<String, String> {
+pub fn export(path: &Path, crs: &CrsSpec, opt: &ExportOptions, profiles: &[ProfileRow], markers: &[MarkerRow], lines: &[LineRow], zones: &[Zone]) -> Result<String, String> {
     if path.exists() {
         std::fs::remove_file(path).map_err(|e| format!("cannot replace {}: {e}", path.display()))?;
     }
@@ -233,34 +241,207 @@ pub fn export(path: &Path, crs: &CrsSpec, opt: &ExportOptions, profiles: &[Profi
         register(&tx, "layer_pick_vertices", "POINT", "GPR layer pick vertices", ext).map_err(e)?;
         summary.push(format!("{n} layer picks"));
     }
-    if opt.interpolations {
-        tx.execute_batch("CREATE TABLE interpolations (fid INTEGER PRIMARY KEY AUTOINCREMENT, geom POINT, zone TEXT, pick_type TEXT, time_ns REAL, depth_m REAL, altitude_m REAL, max_radius_m REAL, cell_size_m REAL)").map_err(e)?;
-        tx.execute_batch("CREATE TABLE interpolation_zones (fid INTEGER PRIMARY KEY AUTOINCREMENT, geom POLYGON, zone TEXT, pick_type TEXT)").map_err(e)?;
-        let (mut ext, mut zext) = (empty, empty);
-        let mut n = 0;
-        for z in zones {
-            for c in &z.cells {
-                let p = [c[0], c[1], c[4]];
-                extent(&[p], &mut ext);
-                tx.execute(
-                    "INSERT INTO interpolations (geom, zone, pick_type, time_ns, depth_m, altitude_m, max_radius_m, cell_size_m) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                    params![geom_blob(srs, 1, &[p], true), z.name, z.pick_type, c[2], c[3], c[4], z.max_radius_m, z.cell_size_m],
-                )
-                .map_err(e)?;
-                n += 1;
-            }
-            if z.polygon.len() >= 3 {
-                let ring: Vec<[f64; 3]> = z.polygon.iter().chain(z.polygon.first()).map(|q| [q[0], q[1], 0.0]).collect();
-                extent(&ring, &mut zext);
-                tx.execute("INSERT INTO interpolation_zones (geom, zone, pick_type) VALUES (?1,?2,?3)", params![geom_blob(srs, 3, &ring, false), z.name, z.pick_type]).map_err(e)?;
-            }
+    if opt.interpolations && zones.iter().any(|z| z.grid.is_some()) {
+        if !crs.is_projected_metres()? {
+            summary.push("Interpolation raster needs a projected CRS in metres".into());
+        } else if let Some(n) = export_raster(&tx, srs, opt.raster_value, zones)? {
+            summary.push(format!("interpolations raster ({n} tiles, {})", opt.raster_value.label()));
         }
-        register(&tx, "interpolations", "POINT", "IDW interpolation cells of layer picks (z = altitude)", ext).map_err(e)?;
-        register(&tx, "interpolation_zones", "POLYGON", "Interpolation zone outlines", zext).map_err(e)?;
-        // The outlines are 2D.
-        tx.execute("UPDATE gpkg_geometry_columns SET z = 0 WHERE table_name = 'interpolation_zones'", []).map_err(e)?;
-        summary.push(format!("{n} interpolation cells"));
     }
     tx.commit().map_err(e)?;
     Ok(summary.join(", "))
+}
+
+fn export_raster(tx: &rusqlite::Transaction, srs: i32, value: RasterValue, zones: &[Zone]) -> Result<Option<usize>, String> {
+    let grids: Vec<_> = zones.iter().filter_map(|z| z.grid.as_ref().map(|g| (z.name.as_str(), g)))
+        .filter(|(_, g)| value.samples(g).iter().any(|v| v.is_finite())).collect();
+    if grids.is_empty() { return Ok(None); }
+    let mut bounds = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+    let mut cell = f64::MAX;
+    for (_, g) in &grids {
+        if g.nx == 0 || g.ny == 0 || !g.cell_m.is_finite() || g.cell_m <= 0.0
+            || !g.origin.iter().all(|v| v.is_finite()) || g.nx.checked_mul(g.ny) != Some(value.samples(g).len()) {
+            return Err("Invalid interpolation grid in project".into());
+        }
+        cell = cell.min(g.cell_m);
+        bounds[0] = bounds[0].min(g.origin[0]);
+        bounds[1] = bounds[1].min(g.origin[1]);
+        bounds[2] = bounds[2].max(g.origin[0] + g.nx as f64 * g.cell_m);
+        bounds[3] = bounds[3].max(g.origin[1] + g.ny as f64 * g.cell_m);
+    }
+    let extent = [(bounds[0] / cell).floor() * cell, (bounds[1] / cell).floor() * cell,
+        (bounds[2] / cell).ceil() * cell, (bounds[3] / cell).ceil() * cell];
+    let (nx, ny) = (((extent[2] - extent[0]) / cell).round(), ((extent[3] - extent[1]) / cell).round());
+    if !nx.is_finite() || !ny.is_finite() || nx < 1.0 || ny < 1.0 || nx * ny > 50_000_000.0 {
+        return Err("Interpolation mosaic is too large; use a larger cell size or smaller zones".into());
+    }
+    let (nx, ny) = (nx as usize, ny as usize);
+    let (mw, mh) = (nx.div_ceil(256), ny.div_ceil(256));
+    let description = format!("{} ({}); {}", value.quantity(), value.unit(), grids.iter().map(|(name, g)|
+        format!("{name}: Max radius {:.3} m, cell size {:.3} m", g.max_radius_m, g.cell_m)).collect::<Vec<_>>().join("; "));
+    let e = |x: rusqlite::Error| x.to_string();
+    tx.execute_batch("CREATE TABLE gpkg_tile_matrix_set (table_name TEXT NOT NULL PRIMARY KEY, srs_id INTEGER NOT NULL, min_x DOUBLE NOT NULL, min_y DOUBLE NOT NULL, max_x DOUBLE NOT NULL, max_y DOUBLE NOT NULL);
+        CREATE TABLE gpkg_tile_matrix (table_name TEXT NOT NULL, zoom_level INTEGER NOT NULL, matrix_width INTEGER NOT NULL, matrix_height INTEGER NOT NULL, tile_width INTEGER NOT NULL, tile_height INTEGER NOT NULL, pixel_x_size DOUBLE NOT NULL, pixel_y_size DOUBLE NOT NULL, PRIMARY KEY (table_name, zoom_level));
+        CREATE TABLE gpkg_extensions (table_name TEXT, column_name TEXT, extension_name TEXT NOT NULL, definition TEXT NOT NULL, scope TEXT NOT NULL, UNIQUE (table_name, column_name, extension_name));
+        CREATE TABLE gpkg_2d_gridded_coverage_ancillary (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, tile_matrix_set_name TEXT NOT NULL UNIQUE, datatype TEXT NOT NULL DEFAULT 'integer', scale REAL NOT NULL DEFAULT 1.0, offset REAL NOT NULL DEFAULT 0.0, precision REAL DEFAULT 1.0, data_null REAL, grid_cell_encoding TEXT DEFAULT 'grid-value-is-center', uom TEXT, field_name TEXT DEFAULT 'Height', quantity_definition TEXT DEFAULT 'Height');
+        CREATE TABLE gpkg_2d_gridded_tile_ancillary (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, tpudt_name TEXT NOT NULL, tpudt_id INTEGER NOT NULL, scale REAL NOT NULL DEFAULT 1.0, offset REAL NOT NULL DEFAULT 0.0, min REAL, max REAL, mean REAL, std_dev REAL, UNIQUE (tpudt_name, tpudt_id));
+        CREATE TABLE interpolations (id INTEGER PRIMARY KEY AUTOINCREMENT, zoom_level INTEGER NOT NULL, tile_column INTEGER NOT NULL, tile_row INTEGER NOT NULL, tile_data BLOB NOT NULL, UNIQUE (zoom_level, tile_column, tile_row));").map_err(e)?;
+    tx.execute("INSERT OR IGNORE INTO gpkg_spatial_ref_sys VALUES ('WGS 84 3D', 4979, 'EPSG', 4979, ?1, 'WGS 84 geographic 3D')",
+        params![CrsSpec::Epsg(4979).wkt().unwrap_or_else(|| "undefined".into())]).map_err(e)?;
+    tx.execute("INSERT INTO gpkg_contents (table_name, data_type, identifier, description, min_x, min_y, max_x, max_y, srs_id) VALUES ('interpolations', '2d-gridded-coverage', 'interpolations', ?1, ?2, ?3, ?4, ?5, ?6)",
+        params![description, extent[0], extent[1], extent[2], extent[3], srs]).map_err(e)?;
+    tx.execute("INSERT INTO gpkg_tile_matrix_set VALUES ('interpolations', ?1, ?2, ?3, ?4, ?5)", params![srs, extent[0], extent[1], extent[2], extent[3]]).map_err(e)?;
+    tx.execute("INSERT INTO gpkg_tile_matrix VALUES ('interpolations', 0, ?1, ?2, 256, 256, ?3, ?3)", params![mw as i64, mh as i64, cell]).map_err(e)?;
+    tx.execute("INSERT INTO gpkg_2d_gridded_coverage_ancillary (tile_matrix_set_name, datatype, scale, offset, precision, data_null, grid_cell_encoding, uom, field_name, quantity_definition) VALUES ('interpolations', 'float', 1.0, 0.0, 0.001, -9999.0, 'grid-value-is-center', ?1, ?2, ?3)",
+        params![value.unit(), value.field(), value.quantity()]).map_err(e)?;
+    for (table, column) in [("gpkg_2d_gridded_coverage_ancillary", None), ("gpkg_2d_gridded_tile_ancillary", None), ("interpolations", Some("tile_data"))] {
+        tx.execute("INSERT INTO gpkg_extensions VALUES (?1, ?2, 'gpkg_2d_gridded_coverage', 'http://docs.opengeospatial.org/is/17-066r1/17-066r1.html', 'read-write')", params![table, column]).map_err(e)?;
+    }
+    let mut written = 0;
+    // shortcut: nearest-cell sampling oversamples coarse zones; smooth only if mixed resolutions need it.
+    for row in 0..mh {
+        for col in 0..mw {
+            let mut tile = vec![-9999.0f32; 256 * 256];
+            let mut filled = false;
+            for py in 0..256 {
+                let j = row * 256 + py;
+                if j >= ny { break; }
+                let y = extent[3] - (j as f64 + 0.5) * cell;
+                for px in 0..256 {
+                    let i = col * 256 + px;
+                    if i >= nx { break; }
+                    let x = extent[0] + (i as f64 + 0.5) * cell;
+                    for (_, g) in &grids {
+                        let (gx, gy) = (((x - g.origin[0]) / g.cell_m).floor() as isize, ((y - g.origin[1]) / g.cell_m).floor() as isize);
+                        if gx >= 0 && gy >= 0 && (gx as usize) < g.nx && (gy as usize) < g.ny {
+                            let sample = value.samples(g)[gy as usize * g.nx + gx as usize];
+                            if sample.is_finite() { tile[py * 256 + px] = sample; filled = true; }
+                        }
+                    }
+                }
+            }
+            if !filled { continue; }
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            tiff::encoder::TiffEncoder::new(&mut bytes).map_err(|e| e.to_string())?
+                .write_image::<tiff::encoder::colortype::Gray32Float>(256, 256, &tile).map_err(|e| e.to_string())?;
+            tx.execute("INSERT INTO interpolations (zoom_level, tile_column, tile_row, tile_data) VALUES (0, ?1, ?2, ?3)",
+                params![col as i64, row as i64, bytes.into_inner()]).map_err(e)?;
+            let id = tx.last_insert_rowid();
+            tx.execute("INSERT INTO gpkg_2d_gridded_tile_ancillary (tpudt_name, tpudt_id, scale, offset) VALUES ('interpolations', ?1, 1.0, 0.0)", params![id]).map_err(e)?;
+            written += 1;
+        }
+    }
+    Ok(Some(written))
+}
+
+#[cfg(test)]
+mod raster_tests {
+    use super::*;
+    use tiff::decoder::{Decoder, DecodingResult};
+
+    fn zone(name: &str, origin: [f64; 2], nx: usize, ny: usize, depth: Vec<f32>) -> Zone {
+        let n = nx * ny;
+        Zone { id: 1, name: name.into(), type_idx: 0, visible: true, polygon: Vec::new(),
+            grid: Some(Grid { origin, cell_m: 1.0, nx, ny, time_ns: vec![5.0; n], depth_m: depth,
+                altitude_m: vec![100.0; n], max_radius_m: 2.0, power: 2.0 }), rev: 0 }
+    }
+
+    fn path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("gpr_raster_{name}_{}.gpkg", std::process::id()))
+    }
+
+    fn opts(value: RasterValue) -> ExportOptions {
+        ExportOptions { profiles: false, markers: false, layers: false, trace_points: false, trace_step: 1,
+            interpolations: true, raster_value: value }
+    }
+
+    fn tile(c: &Connection) -> Vec<f32> {
+        let bytes: Vec<u8> = c.query_row("SELECT tile_data FROM interpolations WHERE zoom_level=0 AND tile_column=0 AND tile_row=0", [], |r| r.get(0)).unwrap();
+        let mut decoder = Decoder::new(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(decoder.dimensions().unwrap(), (256, 256));
+        match decoder.read_image().unwrap() { DecodingResult::F32(v) => v, _ => panic!("expected Float32 TIFF") }
+    }
+
+    #[test]
+    fn writes_float_raster_and_ogc_metadata() {
+        let path = path("single");
+        let zones = [zone("ramp", [0.0, 0.0], 3, 3, vec![1.0, 2.0, 3.0, 4.0, f32::NAN, 6.0, 7.0, 8.0, 9.0])];
+        export(&path, &CrsSpec::Epsg(2056), &opts(RasterValue::Depth), &[], &[], &[], &zones).unwrap();
+        let c = Connection::open(&path).unwrap();
+        let (kind, srs, ext): (String, i32, f64) = c.query_row("SELECT data_type,srs_id,max_x FROM gpkg_contents WHERE table_name='interpolations'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!((kind.as_str(), srs, ext), ("2d-gridded-coverage", 2056, 3.0));
+        let matrix: (i64, i64, f64) = c.query_row("SELECT matrix_width,matrix_height,pixel_x_size FROM gpkg_tile_matrix WHERE table_name='interpolations'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(matrix, (1, 1, 1.0));
+        let matrix_set: i64 = c.query_row("SELECT count(*) FROM gpkg_tile_matrix_set WHERE table_name='interpolations'", [], |r| r.get(0)).unwrap();
+        assert_eq!(matrix_set, 1);
+        let extensions: i64 = c.query_row("SELECT count(*) FROM gpkg_extensions WHERE extension_name='gpkg_2d_gridded_coverage'", [], |r| r.get(0)).unwrap();
+        assert_eq!(extensions, 3);
+        let ancillary: (String, f64, String) = c.query_row("SELECT datatype,data_null,uom FROM gpkg_2d_gridded_coverage_ancillary", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(ancillary, ("float".into(), -9999.0, "m".into()));
+        let tile_ancillary: i64 = c.query_row("SELECT count(*) FROM gpkg_2d_gridded_tile_ancillary", [], |r| r.get(0)).unwrap();
+        assert_eq!(tile_ancillary, 1);
+        let pixels = tile(&c);
+        assert_eq!((pixels[0], pixels[1], pixels[256], pixels[257], pixels[512], pixels[3]),
+            (7.0, 8.0, 4.0, -9999.0, 1.0, -9999.0));
+        let obsolete: i64 = c.query_row("SELECT count(*) FROM sqlite_master WHERE name='interpolation_zones'", [], |r| r.get(0)).unwrap();
+        assert_eq!(obsolete, 0);
+        let geom: i64 = c.query_row("SELECT count(*) FROM gpkg_geometry_columns WHERE table_name='interpolations'", [], |r| r.get(0)).unwrap();
+        assert_eq!(geom, 0);
+        drop(c);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn mosaics_zones_without_erasing_valid_overlap() {
+        let path = path("mosaic");
+        let zones = [zone("west", [0.0, 0.0], 2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+            zone("east", [1.0, 0.0], 2, 2, vec![f32::NAN, 6.0, 7.0, 8.0])];
+        export(&path, &CrsSpec::Epsg(2056), &opts(RasterValue::Depth), &[], &[], &[], &zones).unwrap();
+        let c = Connection::open(&path).unwrap();
+        let extent: (f64, f64) = c.query_row("SELECT min_x,max_x FROM gpkg_tile_matrix_set", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(extent, (0.0, 3.0));
+        let pixels = tile(&c);
+        assert_eq!((pixels[0], pixels[1], pixels[2], pixels[256 + 1], pixels[256 + 2]), (3.0, 7.0, 8.0, 2.0, 6.0));
+        drop(c);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn value_choice_and_geographic_skip() {
+        let zones = [zone("one", [0.0, 0.0], 1, 1, vec![2.0])];
+        for (choice, expected) in [(RasterValue::Time, 5.0), (RasterValue::Altitude, 100.0)] {
+            let path = path(choice.field());
+            export(&path, &CrsSpec::Epsg(2056), &opts(choice), &[], &[], &[], &zones).unwrap();
+            let c = Connection::open(&path).unwrap();
+            assert_eq!(tile(&c)[0], expected);
+            drop(c);
+            std::fs::remove_file(path).unwrap();
+        }
+        let path = path("geographic");
+        let summary = export(&path, &CrsSpec::Epsg(4326), &opts(RasterValue::Depth), &[], &[], &[], &zones).unwrap();
+        assert!(summary.contains("Interpolation raster needs a projected CRS"));
+        let c = Connection::open(&path).unwrap();
+        let count: i64 = c.query_row("SELECT count(*) FROM sqlite_master WHERE name='interpolations'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        drop(c);
+        std::fs::remove_file(path).unwrap();
+
+        let path = self::path("feet");
+        let feet = CrsSpec::Proj("+proj=utm +zone=32 +datum=WGS84 +units=ft +no_defs".into());
+        let summary = export(&path, &feet, &opts(RasterValue::Depth), &[], &[], &[], &zones).unwrap();
+        assert!(summary.contains("Interpolation raster needs a projected CRS"));
+        let c = Connection::open(&path).unwrap();
+        let count: i64 = c.query_row("SELECT count(*) FROM sqlite_master WHERE name='interpolations'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        drop(c);
+        std::fs::remove_file(path).unwrap();
+
+        let path = self::path("no_grid");
+        export(&path, &CrsSpec::Epsg(2056), &opts(RasterValue::Depth), &[], &[], &[], &[]).unwrap();
+        let c = Connection::open(&path).unwrap();
+        let count: i64 = c.query_row("SELECT count(*) FROM sqlite_master WHERE name='interpolations'", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        drop(c);
+        std::fs::remove_file(path).unwrap();
+    }
 }

@@ -1,8 +1,8 @@
 //! Project files (.gprproj, JSON): data file paths, processing, GPS, picks, CRS and basemaps.
 
-use crate::app::App;
+use crate::app::{App, MapMode};
 use crate::crs::CrsSpec;
-use crate::model::{GpsTrack, LinePick, Marker, MarkerType};
+use crate::model::{GpsTrack, LinePick, ManualGrid, Marker, MarkerType};
 use crate::model::Profile;
 use crate::processing::{Ctx, Progress, StepEntry};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,8 @@ struct ProjProfile {
     use_gps_distance: bool,
     #[serde(default)]
     dx_user_set: bool,
+    #[serde(default)]
+    manual_line: Option<u32>,
     #[serde(default)]
     show_topo: bool,
     #[serde(default)]
@@ -54,6 +56,10 @@ pub struct ProjFile {
     zones: Vec<crate::interp::Zone>,
     #[serde(default)]
     interp: crate::interp::InterpParams,
+    #[serde(default)]
+    map_mode: MapMode,
+    #[serde(default)]
+    manual_grid: Option<ManualGrid>,
 }
 
 pub fn save(app: &App, path: &Path) -> Result<(), String> {
@@ -123,6 +129,7 @@ fn build(app: &App, base: Option<&Path>) -> ProjFile {
                 freq_mhz: p.freq_mhz,
                 use_gps_distance: p.use_gps_distance,
                 dx_user_set: p.dx_user_set,
+                manual_line: p.manual_line,
                 show_topo: p.show_topo,
                 reverse_display: p.reverse_display,
                 steps: p.steps.clone(),
@@ -138,6 +145,8 @@ fn build(app: &App, base: Option<&Path>) -> ProjFile {
         show_crossings: app.show_crossings,
         zones: app.zones.clone(),
         interp: app.interp.clone(),
+        map_mode: app.map_mode,
+        manual_grid: app.manual_grid.clone(),
     }
 }
 
@@ -207,6 +216,7 @@ pub fn load_profiles(mut file: ProjFile, path: PathBuf, prog: &std::sync::Arc<Pr
                 p.use_gps_distance = if file.version >= 2 { pp.use_gps_distance } else { !p.dx_from_file };
                 p.steps = pp.steps;
                 p.gps = pp.gps;
+                p.manual_line = pp.manual_line;
                 if p.steps.iter().any(|e| e.enabled) {
                     p.update_coords(&file.crs);
                     let (topography, topography_error) = crate::processing::topography_for_steps(&p, &file.crs);
@@ -239,6 +249,8 @@ pub fn apply(app: &mut App, l: Loaded) -> String {
     app.lines.clear();
     app.basemaps.clear();
     app.project_crs = f.crs;
+    app.map_mode = f.map_mode;
+    app.manual_grid = f.manual_grid;
     app.crs_text = match &app.project_crs {
         CrsSpec::Epsg(c) => c.to_string(),
         CrsSpec::Proj(s) => s.clone(),
@@ -247,7 +259,9 @@ pub fn apply(app: &mut App, l: Loaded) -> String {
     app.marker_types = f.marker_types;
     let mut id_map = std::collections::HashMap::new();
     for (old, p) in l.profiles {
+        let saved_manual_line = p.manual_line;
         let new_id = app.add_profile(p);
+        if app.manual_grid.is_some() && saved_manual_line.is_none() { app.assign_manual_line(new_id, None); }
         id_map.insert(old, new_id);
         if let Some(i) = app.profile_index(new_id) {
             // Keep the velocity a time-depth step defines and fit the view to the processed data.
@@ -666,13 +680,41 @@ mod interpolation_project_tests {
     fn old_project_without_new_fields_opens_with_defaults() {
         let app = App::headless(vec![], None);
         let mut v = serde_json::to_value(build(&app, None)).unwrap();
-        for k in ["show_crossings", "zones", "interp"] {
+        for k in ["show_crossings", "zones", "interp", "map_mode", "manual_grid"] {
             v.as_object_mut().unwrap().remove(k);
         }
+        for p in v["profiles"].as_array_mut().unwrap() { p.as_object_mut().unwrap().remove("manual_line"); }
         let f: ProjFile = serde_json::from_value(v).unwrap();
         assert!(f.show_crossings);
         assert!(f.zones.is_empty());
         assert_eq!(f.interp, crate::interp::InterpParams::default());
+        assert_eq!(f.map_mode, MapMode::Gps);
+        assert!(f.manual_grid.is_none());
+    }
+
+    #[test]
+    fn manual_grid_rebuilds_on_reopen_without_changing_gps() {
+        let mut app = App::headless(vec![], None);
+        app.remember_projects = false;
+        app.add_profile(crate::demo::make().remove(0));
+        let gps = app.profiles[0].coords.clone();
+        let csv = "USER INFO\nName\tPrivate Example\nSETTINGS\nMode\tArea Scan\nGrid Size - X [cm]\t160\nGrid Size - Y [cm]\t120\nGrid Spacing - X [cm]\t10\nGrid Spacing - Y [cm]\t10\nSCAN DISTANCE [m]\nLine 1\t1.60\n";
+        app.import_manual_grid(csv, "scan.csv").unwrap();
+        app.set_map_mode(MapMode::Manual);
+        let path = PathBuf::from("target/manual-grid-reopen.gprproj");
+        save(&app, &path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("Private Example"));
+        let loaded = load_profiles(parse(&path).unwrap(), path, &Progress::new());
+        let mut reopened = App::headless(vec![], None);
+        reopened.remember_projects = false;
+        apply(&mut reopened, loaded);
+        assert_eq!(reopened.map_mode, MapMode::Manual);
+        assert!(reopened.profiles[0].coords.iter().zip(gps.iter()).all(|(a, b)|
+            a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-5)));
+        assert_eq!(reopened.profiles[0].manual_line, Some(1));
+        assert_eq!(reopened.profiles[0].manual_coords.as_ref().unwrap().len(), reopened.profiles[0].raw.ntr);
+        assert!((reopened.profiles[0].dist.last().unwrap() - 1.6).abs() < 1e-9);
     }
 
     #[test]
@@ -873,13 +915,13 @@ mod performance_measurements {
         let profiles = (0..channels).map(|channel| ProjProfile {
             id: channel as u32 + 1, name: format!("channel {channel}"), path: path.clone(), channel,
             dx: 0.05, velocity: 0.1, freq_mhz: 500.0, use_gps_distance: false,
-            dx_user_set: false, show_topo: false, reverse_display: false,
+            dx_user_set: false, manual_line: None, show_topo: false, reverse_display: false,
             steps: vec![StepEntry { enabled: true, step: crate::processing::Step::Dewow { window_ns: 5.0 } }], gps: None,
         }).collect();
         let file = ProjFile {
             version: 2, crs: CrsSpec::Epsg(2056), profiles,
             marker_types: crate::model::default_marker_types(), markers: vec![], lines: vec![], basemaps: vec![],
-            next_pick_id: 1, import, show_crossings: true, zones: vec![], interp: Default::default(),
+            next_pick_id: 1, import, show_crossings: true, zones: vec![], interp: Default::default(), map_mode: MapMode::Gps, manual_grid: None,
         };
         let t = Instant::now();
         let loaded = load_profiles(file, dir.join("project.gprproj"), &Progress::new());
