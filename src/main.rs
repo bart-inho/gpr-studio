@@ -10,6 +10,7 @@ mod formats;
 mod gpkg;
 mod gps;
 mod gpsbatch;
+mod interp;
 mod mapview;
 mod model;
 mod pdf;

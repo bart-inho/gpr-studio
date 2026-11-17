@@ -48,6 +48,12 @@ pub struct ProjFile {
     basemaps: Vec<ProjBasemap>,
     next_pick_id: u32,
     import: crate::formats::ImportOptions,
+    #[serde(default = "crate::interp::yes")]
+    show_crossings: bool,
+    #[serde(default)]
+    zones: Vec<crate::interp::Zone>,
+    #[serde(default)]
+    interp: crate::interp::InterpParams,
 }
 
 pub fn save(app: &App, path: &Path) -> Result<(), String> {
@@ -129,6 +135,9 @@ fn build(app: &App, base: Option<&Path>) -> ProjFile {
         basemaps: app.basemaps.iter().map(|b| ProjBasemap { path: rel(base, &b.path), crs: b.crs.clone(), visible: b.visible, opacity: b.opacity }).collect(),
         next_pick_id: app.next_pick_id,
         import: app.import_opts.clone(),
+        show_crossings: app.show_crossings,
+        zones: app.zones.clone(),
+        interp: app.interp.clone(),
     }
 }
 
@@ -264,6 +273,12 @@ pub fn apply(app: &mut App, l: Loaded) -> String {
             app.lines.push(ln);
         }
     }
+    app.show_crossings = f.show_crossings;
+    app.zones = f.zones;
+    app.interp = f.interp;
+    app.zone_tex.clear();
+    app.zone_draw = None;
+    app.interp_jobs.clear();
     app.next_pick_id = f.next_pick_id.max(app.markers.iter().map(|m| m.id).chain(app.lines.iter().map(|l| l.id)).max().unwrap_or(0) + 1);
     let base = l.path.parent().unwrap_or(Path::new("")).to_path_buf();
     for b in f.basemaps {
@@ -644,6 +659,48 @@ mod topographic_project_tests {
 }
 
 #[cfg(test)]
+mod interpolation_project_tests {
+    use super::*;
+
+    #[test]
+    fn old_project_without_new_fields_opens_with_defaults() {
+        let app = App::headless(vec![], None);
+        let mut v = serde_json::to_value(build(&app, None)).unwrap();
+        for k in ["show_crossings", "zones", "interp"] {
+            v.as_object_mut().unwrap().remove(k);
+        }
+        let f: ProjFile = serde_json::from_value(v).unwrap();
+        assert!(f.show_crossings);
+        assert!(f.zones.is_empty());
+        assert_eq!(f.interp, crate::interp::InterpParams::default());
+    }
+
+    #[test]
+    fn zones_and_their_grid_survive_save_and_reopen() {
+        let mut app = App::headless(vec![], None);
+        app.remember_projects = false;
+        app.load_demo(true);
+        let c = &app.profiles[0].coords;
+        let (x0, x1) = c.iter().fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p[0]), a.1.max(p[0])));
+        let (y0, y1) = c.iter().fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p[1]), a.1.max(p[1])));
+        app.zones.push(crate::interp::Zone { id: 1, name: "Interpolation 1".into(), type_idx: 6, visible: true, polygon: vec![[x0 - 2.0, y0 - 2.0], [x1 + 2.0, y0 - 2.0], [x1 + 2.0, y1 + 2.0], [x0 - 2.0, y1 + 2.0]], grid: None, rev: 0 });
+        let (pts, poly) = app.zone_inputs(1).unwrap();
+        app.zones[0].grid = Some(crate::interp::interpolate(&pts, &poly, &app.interp).unwrap());
+        app.show_crossings = false;
+        let filled = app.zones[0].grid.as_ref().unwrap().filled();
+        assert!(filled > 100);
+        let path = PathBuf::from("target/interpolation-reopen.gprproj");
+        save(&app, &path).unwrap();
+        let loaded = load_profiles(parse(&path).unwrap(), path, &Progress::new());
+        let mut reopened = App::headless(vec![], None);
+        reopened.remember_projects = false;
+        apply(&mut reopened, loaded);
+        assert!(!reopened.show_crossings);
+        assert_eq!(reopened.zones[0].grid.as_ref().unwrap().filled(), filled);
+    }
+}
+
+#[cfg(test)]
 mod collect_tests {
     use super::*;
 
@@ -822,7 +879,7 @@ mod performance_measurements {
         let file = ProjFile {
             version: 2, crs: CrsSpec::Epsg(2056), profiles,
             marker_types: crate::model::default_marker_types(), markers: vec![], lines: vec![], basemaps: vec![],
-            next_pick_id: 1, import,
+            next_pick_id: 1, import, show_crossings: true, zones: vec![], interp: Default::default(),
         };
         let t = Instant::now();
         let loaded = load_profiles(file, dir.join("project.gprproj"), &Progress::new());

@@ -230,7 +230,20 @@ pub struct App {
     pub collect_confirm: Option<PathBuf>,
     /// Collect and save: summary shown in a small window.
     pub collect_report: Option<String>,
+    /// Show layer picks of crossing profiles in the data view.
+    pub show_crossings: bool,
+    /// (coordinates key, crossings) — recomputed when the coordinates change.
+    pub crossings: (u64, Vec<crate::interp::Crossing>),
+    pub zones: Vec<crate::interp::Zone>,
+    pub interp: crate::interp::InterpParams,
+    /// Polygon being drawn on the map: (zone id, vertices so far).
+    pub zone_draw: Option<(u32, Vec<[f64; 2]>)>,
+    /// Map texture per zone id: (zone rev, texture).
+    pub zone_tex: HashMap<u32, (u64, egui::TextureHandle)>,
+    pub interp_jobs: Vec<(u32, Receiver<Result<crate::interp::Grid, String>>)>,
 }
+
+pub const ZONE_DRAW_HELP: &str = "Left click: add vertex · Right click / Enter: close polygon · Esc: cancel";
 
 impl App {
     pub fn new(cc: &eframe::CreationContext, files: Vec<PathBuf>, screenshot: Option<PathBuf>) -> Self {
@@ -341,7 +354,7 @@ impl App {
             show_pdf: false,
             show_about: false,
             show_header: false,
-            gpkg_opts: crate::gpkg::ExportOptions { profiles: true, markers: true, layers: true, trace_points: false, trace_step: 10 },
+            gpkg_opts: crate::gpkg::ExportOptions { profiles: true, markers: true, layers: true, trace_points: false, trace_step: 10, interpolations: true },
             pdf_opts: PdfOptions { a3: false, range: PdfRange::Visible, chunk_m: 20.0, one_to_one: true, all_profiles: false, basemap: true, markers: true, processing: true, title: String::new() },
             status: "Open GPR files with File > Open, or load the demo survey.".into(),
             screenshot,
@@ -367,6 +380,13 @@ impl App {
             show_settings: false,
             collect_confirm: None,
             collect_report: None,
+            show_crossings: true,
+            crossings: (0, Vec::new()),
+            zones: Vec::new(),
+            interp: Default::default(),
+            zone_draw: None,
+            zone_tex: HashMap::new(),
+            interp_jobs: Vec::new(),
         };
         if app.screenshot.is_some() {
             app.load_demo(true);
@@ -636,6 +656,7 @@ impl App {
 
     fn poll_jobs(&mut self, ctx: &egui::Context) {
         self.poll_jobs_inner();
+        self.poll_interp_jobs();
         if !self.basemap_jobs.is_empty() {
             ctx.request_repaint();
         }
@@ -1262,6 +1283,7 @@ impl App {
                 ui.add(egui::DragValue::new(&mut self.gpkg_opts.trace_step).range(1..=10000));
                 ui.label("traces");
             });
+            ui.checkbox(&mut self.gpkg_opts.interpolations, "Interpolations (cells as points with time, depth, altitude; zone outlines)");
             if no_gps > 0 {
                 ui.colored_label(crate::draw::warn_color(ui), format!("{no_gps} profile(s) have no GPS and are left out of the map layers."));
             }
@@ -1350,7 +1372,19 @@ impl App {
                 Some(LineRow { id: l.id, profile: p.name.clone(), type_name: t.name.clone(), comment: l.comment.clone(), color: hex(t.color), pts })
             })
             .collect();
-        crate::gpkg::export(path, &self.project_crs, &self.gpkg_opts, &profiles, &markers, &lines)
+        let zones: Vec<ZoneRow> = self
+            .zones
+            .iter()
+            .map(|z| ZoneRow {
+                name: z.name.clone(),
+                pick_type: self.marker_types.get(z.type_idx).map(|t| t.name.clone()).unwrap_or_default(),
+                polygon: z.polygon.clone(),
+                cells: z.grid.as_ref().map(|g| g.cells()).unwrap_or_default(),
+                max_radius_m: z.grid.as_ref().map(|g| g.max_radius_m).unwrap_or(self.interp.max_radius_m),
+                cell_size_m: z.grid.as_ref().map(|g| g.cell_m).unwrap_or(self.interp.cell_m),
+            })
+            .collect();
+        crate::gpkg::export(path, &self.project_crs, &self.gpkg_opts, &profiles, &markers, &lines, &zones)
     }
 
     fn pdf_window(&mut self, ctx: &egui::Context) {
@@ -1887,6 +1921,7 @@ impl App {
                     self.show_marker_types = true;
                 }
             });
+            ui.checkbox(&mut self.show_crossings, "Show crossing picks").on_hover_text("Layer picks of the profiles that cross this one, at the crossing point (same depth, converted with each profile's velocity)");
             if let Some(h) = self.hyperbola.clone() {
                 ui.separator();
                 ui.label(RichText::new(format!("Hyperbola: v = {:.4} m/ns", h.velocity)).strong());
@@ -1913,8 +1948,166 @@ impl App {
                     self.hyperbola = None;
                 }
             }
+            self.interpolation_ui(ui);
         });
     }
+
+    fn interpolation_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::interp::Zone;
+        ui.separator();
+        ui.heading("Interpolation");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Max radius");
+            ui.add(egui::DragValue::new(&mut self.interp.max_radius_m).speed(0.1).range(0.01..=1000.0).suffix(" m"));
+            ui.label("Cell");
+            ui.add(egui::DragValue::new(&mut self.interp.cell_m).speed(0.01).range(0.01..=100.0).suffix(" m"));
+            ui.label("Power");
+            ui.add(egui::DragValue::new(&mut self.interp.power).speed(0.1).range(0.5..=6.0));
+        });
+        let line_types: Vec<usize> = self.marker_types.iter().enumerate().filter(|(_, t)| t.kind == MarkerKind::Line).map(|(i, _)| i).collect();
+        if ui.button("New zone").on_hover_text("Draw a polygon on the map, then interpolate the layer picks of one type inside it").clicked() {
+            let id = self.zones.iter().map(|z| z.id).max().unwrap_or(0) + 1;
+            let type_idx = if line_types.contains(&self.cur_type) { self.cur_type } else { line_types.first().copied().unwrap_or(0) };
+            self.zones.push(Zone { id, name: format!("Interpolation {id}"), type_idx, visible: true, polygon: vec![], grid: None, rev: 0 });
+            self.zone_draw = Some((id, vec![]));
+            self.status = ZONE_DRAW_HELP.into();
+        }
+        let (mut del, mut draw, mut run) = (None, None, None);
+        let types = &self.marker_types;
+        for z in self.zones.iter_mut() {
+            let running = self.interp_jobs.iter().any(|j| j.0 == z.id);
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut z.visible, "").on_hover_text("Show on the map and the profiles");
+                ui.add(egui::TextEdit::singleline(&mut z.name).desired_width(95.0));
+                egui::ComboBox::from_id_salt(("zone_type", z.id)).width(90.0).selected_text(types.get(z.type_idx).map(|t| t.name.as_str()).unwrap_or("?")).show_ui(ui, |ui| {
+                    for &i in &line_types {
+                        ui.selectable_value(&mut z.type_idx, i, &types[i].name);
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                if ui.small_button("Draw").on_hover_text("Draw the polygon again").clicked() {
+                    draw = Some(z.id);
+                }
+                if ui.add_enabled(z.polygon.len() >= 3 && !running, egui::Button::new("Interpolate").small()).clicked() {
+                    run = Some(z.id);
+                }
+                if ui.small_button("✖").on_hover_text("Delete zone").clicked() {
+                    del = Some(z.id);
+                }
+                if running {
+                    ui.add(egui::Spinner::new());
+                } else if self.zone_draw.as_ref().is_some_and(|d| d.0 == z.id) {
+                    ui.weak("drawing on the map…");
+                } else if let Some(g) = &z.grid {
+                    let (lo, hi) = g.depth_range().unwrap_or((f32::NAN, f32::NAN));
+                    ui.weak(format!("interpolated: {} cells, depth {lo:.2}–{hi:.2} m", g.filled()));
+                } else if z.polygon.len() >= 3 {
+                    ui.weak(format!("{} vertices", z.polygon.len()));
+                } else {
+                    ui.weak("no polygon");
+                }
+            });
+        }
+        if let Some(id) = draw {
+            self.zone_draw = Some((id, vec![]));
+            self.status = ZONE_DRAW_HELP.into();
+        }
+        if let Some(id) = run {
+            self.start_interpolation(id, ui.ctx());
+        }
+        if let Some(id) = del {
+            self.zones.retain(|z| z.id != id);
+            self.zone_tex.remove(&id);
+            self.interp_jobs.retain(|j| j.0 != id);
+            if self.zone_draw.as_ref().is_some_and(|d| d.0 == id) {
+                self.zone_draw = None;
+            }
+        }
+    }
+
+    /// Crossings of the GPS tracks, recomputed only when the coordinates change.
+    pub fn update_crossings(&mut self) {
+        let key = crate::interp::crossings_key(&self.profiles);
+        if self.crossings.0 != key {
+            self.crossings = (key, crate::interp::crossings(&self.profiles));
+        }
+    }
+
+    /// Input points and polygon of a zone (quick; the interpolation itself runs on a thread).
+    pub fn zone_inputs(&self, id: u32) -> Result<(Vec<crate::interp::InPt>, Vec<[f64; 2]>), String> {
+        let z = self.zones.iter().find(|z| z.id == id).ok_or("zone not found")?;
+        let pts = crate::interp::zone_points(&self.profiles, &self.lines, z, self.interp.cell_m);
+        if pts.is_empty() {
+            let t = self.marker_types.get(z.type_idx).map(|t| t.name.as_str()).unwrap_or("?");
+            return Err(format!("no \"{t}\" layer picks inside {}", z.name));
+        }
+        Ok((pts, z.polygon.clone()))
+    }
+
+    fn start_interpolation(&mut self, id: u32, ctx: &egui::Context) {
+        match self.zone_inputs(id) {
+            Ok((pts, poly)) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let params = self.interp.clone();
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(crate::interp::interpolate(&pts, &poly, &params));
+                    ctx.request_repaint();
+                });
+                self.interp_jobs.push((id, rx));
+            }
+            Err(e) => self.status = format!("Interpolation: {e}."),
+        }
+    }
+
+    fn poll_interp_jobs(&mut self) {
+        let mut done = Vec::new();
+        self.interp_jobs.retain(|(id, rx)| match rx.try_recv() {
+            Ok(r) => {
+                done.push((*id, r));
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(_) => false,
+        });
+        for (id, r) in done {
+            let Some(z) = self.zones.iter_mut().find(|z| z.id == id) else { continue };
+            match r {
+                Ok(g) => {
+                    self.status = format!("{}: {} cells interpolated.", z.name, g.filled());
+                    z.grid = Some(g);
+                    z.rev += 1;
+                }
+                Err(e) => self.status = format!("{}: interpolation failed: {e}", z.name),
+            }
+        }
+    }
+
+    /// Right click / Enter on the map: the polygon in progress becomes the zone's polygon.
+    pub fn close_zone_polygon(&mut self) {
+        let Some((id, pts)) = self.zone_draw.take() else { return };
+        if pts.len() < 3 {
+            self.status = format!("A polygon needs at least 3 vertices ({} so far). {ZONE_DRAW_HELP}", pts.len());
+            self.zone_draw = Some((id, pts));
+            return;
+        }
+        if let Some(z) = self.zones.iter_mut().find(|z| z.id == id) {
+            self.status = format!("{}: polygon of {} vertices. Click Interpolate.", z.name, pts.len());
+            z.polygon = pts;
+            // The old surface belongs to the old polygon.
+            z.grid = None;
+            z.rev += 1;
+        }
+    }
+
+    /// Esc: the zone keeps its previous polygon, or is removed if it never had one.
+    pub fn cancel_zone_polygon(&mut self) {
+        let Some((id, _)) = self.zone_draw.take() else { return };
+        self.zones.retain(|z| z.id != id || z.polygon.len() >= 3);
+        self.status = "Polygon drawing cancelled.".into();
+    }
+
 
     pub fn save_hyperbola(&mut self) {
         if self.active.is_some() && self.hyperbola.is_some() { self.record_pick_undo(); }

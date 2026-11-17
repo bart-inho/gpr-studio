@@ -250,12 +250,47 @@ pub fn run(out: PathBuf, files: Vec<PathBuf>) -> i32 {
         println!("TRACE-TO-TRACE LEVEL JUMP: input {:.3}, AGC {:.3}, AGC smoothed over 25 traces {:.3}, running average 8 traces {:.3}", jump(&src), jump(&a1), jump(&a25), jump(&ra));
     }
 
+    // Crossings and an interpolation zone around the demo layer pick
+    app.update_crossings();
+    println!("CROSSINGS {} between the demo profiles", app.crossings.1.len());
+    if app.crossings.1.is_empty() {
+        println!("FAIL: the demo profiles cross but no crossing was found");
+        fails += 1;
+    }
+    if let Some(c) = app.lines.first().and_then(|l| app.profiles.iter().find(|p| p.id == l.profile_id)).map(|p| p.coords.clone()) {
+        let (x0, x1) = c.iter().fold((f64::MAX, f64::MIN), |a, q| (a.0.min(q[0]), a.1.max(q[0])));
+        let (y0, y1) = c.iter().fold((f64::MAX, f64::MIN), |a, q| (a.0.min(q[1]), a.1.max(q[1])));
+        let type_idx = app.lines[0].type_idx;
+        app.zones.push(crate::interp::Zone { id: 1, name: "Interpolation 1".into(), type_idx, visible: true, polygon: vec![[x0 - 3.0, y0 - 3.0], [x1 + 3.0, y0 - 3.0], [x1 + 3.0, y1 + 3.0], [x0 - 3.0, y1 + 3.0]], grid: None, rev: 0 });
+        let t = std::time::Instant::now();
+        match app.zone_inputs(1).and_then(|(pts, poly)| crate::interp::interpolate(&pts, &poly, &app.interp)) {
+            Ok(g) => {
+                println!("INTERPOLATION OK {} cells of {} x {} in {:.3} s, depth {:?}", g.filled(), g.nx, g.ny, t.elapsed().as_secs_f64(), g.depth_range());
+                app.zones[0].grid = Some(g);
+            }
+            Err(e) => {
+                println!("INTERPOLATION FAIL {e}");
+                fails += 1;
+            }
+        }
+    }
+
     // Exports
     let g = out.join("selftest.gpkg");
     app.gpkg_opts.trace_points = true;
     let export_started = std::time::Instant::now();
     match app.export_gpkg(&g) {
-        Ok(s) => println!("GPKG OK {} ({s}) in {:.3} s", g.display(), export_started.elapsed().as_secs_f64()),
+        Ok(s) => {
+            println!("GPKG OK {} ({s}) in {:.3} s", g.display(), export_started.elapsed().as_secs_f64());
+            let rows = rusqlite::Connection::open(&g).and_then(|c| c.query_row("SELECT COUNT(*), SUM(time_ns IS NULL OR depth_m IS NULL OR altitude_m IS NULL OR time_ns != time_ns) FROM interpolations", [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0)))));
+            match rows {
+                Ok((n, 0)) if n > 0 => println!("GPKG interpolations: {n} rows, all finite"),
+                other => {
+                    println!("FAIL: GPKG interpolations {other:?}");
+                    fails += 1;
+                }
+            }
+        }
         Err(e) => {
             println!("GPKG FAIL {e}");
             fails += 1;

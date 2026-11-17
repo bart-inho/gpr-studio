@@ -7,6 +7,7 @@ use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke};
 
 pub const SECTION_COLOR: Color32 = Color32::from_rgb(255, 140, 0);
 pub const ACTIVE_COLOR: Color32 = Color32::from_rgb(25, 85, 220);
+pub const ZONE_COLOR: Color32 = Color32::from_rgb(255, 80, 200);
 
 impl App {
     pub fn is_geographic(&self) -> bool {
@@ -132,12 +133,27 @@ impl App {
                 self.map.center[1] = wy + (hp.y - rect.center().y) as f64 * self.map.scale;
             }
         }
-        if resp.double_clicked() {
+        let drawing = self.zone_draw.is_some();
+        if resp.double_clicked() && !drawing {
             self.map.fitted = false;
         }
         let (cx, cy, sc) = (self.map.center[0], self.map.center[1], self.map.scale);
         let to_s = |x: f64, y: f64| Pos2::new(rect.center().x + ((x - cx) / sc) as f32, rect.center().y - ((y - cy) / sc) as f32);
         let to_w = |p: Pos2| [cx + (p.x - rect.center().x) as f64 * sc, cy - (p.y - rect.center().y) as f64 * sc];
+        // Zone polygon drawing: a click (not a drag) adds a vertex.
+        if drawing {
+            if resp.clicked() {
+                if let (Some(pos), Some((_, pts))) = (resp.interact_pointer_pos(), self.zone_draw.as_mut()) {
+                    pts.push(to_w(pos));
+                }
+            }
+            let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+            if esc {
+                self.cancel_zone_polygon();
+            } else if resp.secondary_clicked() || enter {
+                self.close_zone_polygon();
+            }
+        }
 
         let painter = ui.painter_at(rect);
         let dark = ui.visuals().dark_mode;
@@ -230,6 +246,24 @@ impl App {
                         draw_mesh(&painter, t.id(), verts, &to_s, alpha);
                     }
                 }
+            }
+        }
+
+        // ---------------------------------------------------------- interpolation zones
+        for z in self.zones.iter().filter(|z| z.visible) {
+            if let Some(g) = &z.grid {
+                if self.zone_tex.get(&z.id).map(|t| t.0 != z.rev).unwrap_or(true) {
+                    let ci = egui::ColorImage::from_rgba_unmultiplied([g.nx, g.ny], &g.rgba());
+                    self.zone_tex.insert(z.id, (z.rev, ctx.load_texture(format!("zone-{}", z.id), ci, egui::TextureOptions::NEAREST)));
+                }
+                let (x1, y1) = (g.origin[0] + g.nx as f64 * g.cell_m, g.origin[1] + g.ny as f64 * g.cell_m);
+                let r = Rect::from_two_pos(to_s(g.origin[0], y1), to_s(x1, g.origin[1]));
+                painter.image(self.zone_tex[&z.id].1.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::from_white_alpha(178));
+            }
+            if z.polygon.len() >= 3 {
+                let pts: Vec<Pos2> = z.polygon.iter().map(|q| to_s(q[0], q[1])).collect();
+                painter.add(egui::Shape::closed_line(pts.clone(), Stroke::new(1.2_f32, ZONE_COLOR)));
+                painter.text(pts[0] + egui::vec2(4.0, -4.0), Align2::LEFT_BOTTOM, &z.name, FontId::proportional(10.5), ZONE_COLOR);
             }
         }
 
@@ -338,11 +372,40 @@ impl App {
                     painter.text(at + egui::vec2(10.0, 8.0), Align2::LEFT_TOP, format!("{}  trace {:.0}  {:.1} m", p.name, tr + 1.0, p.dist_at(tr)), FontId::proportional(11.0), text);
                 }
             }
-            if resp.clicked() {
+            if resp.clicked() && !drawing {
                 self.focus_trace(pid, tr);
             }
         }
         self.map.hover_world = hp.map(to_w);
+
+        // Polygon in progress: vertices, edges and a rubber band to the pointer.
+        if let Some((_, pts)) = &self.zone_draw {
+            let mut sp: Vec<Pos2> = pts.iter().map(|q| to_s(q[0], q[1])).collect();
+            if let Some(h) = hp {
+                sp.push(h);
+            }
+            painter.add(egui::Shape::line(sp.clone(), Stroke::new(1.5_f32, ZONE_COLOR)));
+            for q in sp.iter().take(pts.len()) {
+                painter.circle(*q, 3.5, ZONE_COLOR, Stroke::new(1.0_f32, Color32::BLACK));
+            }
+            painter.text(rect.center_top() + egui::vec2(0.0, 6.0), Align2::CENTER_TOP, crate::app::ZONE_DRAW_HELP, FontId::proportional(11.0), text);
+        }
+        // Legend of the interpolations (Jet, min to max depth).
+        let mut ly = rect.top() + 64.0;
+        for z in self.zones.iter().filter(|z| z.visible) {
+            let Some((lo, hi)) = z.grid.as_ref().and_then(|g| g.depth_range()) else { continue };
+            let lr = Rect::from_min_size(Pos2::new(rect.right() - 150.0, ly), egui::vec2(144.0, 40.0));
+            painter.rect_filled(lr, 3.0, Color32::from_rgba_unmultiplied(255, 255, 255, 210));
+            painter.text(lr.min + egui::vec2(5.0, 3.0), Align2::LEFT_TOP, format!("{} · depth", z.name), FontId::proportional(10.5), Color32::BLACK);
+            let (bx, by, bw) = (lr.left() + 5.0, lr.top() + 17.0, lr.width() - 10.0);
+            for k in 0..32 {
+                let c = crate::render::ColorMap::Jet.color(k as f32 / 31.0 * 2.0 - 1.0);
+                painter.rect_filled(Rect::from_min_size(Pos2::new(bx + bw * k as f32 / 32.0, by), egui::vec2(bw / 32.0 + 0.5, 8.0)), 0.0, Color32::from_rgb(c[0], c[1], c[2]));
+            }
+            painter.text(Pos2::new(bx, by + 9.0), Align2::LEFT_TOP, format!("{lo:.2} m"), FontId::proportional(10.0), Color32::BLACK);
+            painter.text(Pos2::new(bx + bw, by + 9.0), Align2::RIGHT_TOP, format!("{hi:.2} m"), FontId::proportional(10.0), Color32::BLACK);
+            ly += 46.0;
+        }
 
         // ---------------------------------------------------------- decorations
         if self.profiles.iter().all(|p| !p.has_coords()) && self.basemaps.is_empty() {

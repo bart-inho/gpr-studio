@@ -137,6 +137,7 @@ impl App {
         };
         if !ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary)) { self.velocity_drag_active = false; }
         let pid = self.profiles[a].id;
+        self.update_crossings();
         let reversed = self.profiles[a].reverse_display;
         // Topography: per-trace shift (display samples) and the shifted section to draw.
         let migrated = self.profiles[a].proc.depth_datum_m.is_some();
@@ -448,6 +449,51 @@ impl App {
                 draw_line(l, true, false);
             }
         }
+        // Interpolation surfaces sampled under this profile (read-only, pink).
+        if p.has_coords() {
+            let n = (plot.width() / 2.0).max(2.0) as usize;
+            let (ta, tb) = (view.tr0.max(0.0), view.tr1.min(ntr - 1.0));
+            for z in self.zones.iter().filter(|z| z.visible) {
+                let Some(g) = &z.grid else { continue };
+                let mut runs: Vec<Vec<Pos2>> = vec![vec![]];
+                for k in 0..=n {
+                    let tr = ta + (tb - ta) * k as f32 / n as f32;
+                    match p.coord_at(tr).and_then(|c| g.depth_at(c[0], c[1])) {
+                        Some(d) => runs.last_mut().unwrap().push(line_pt(tr, p.time_of_depth(d))),
+                        None if !runs.last().unwrap().is_empty() => runs.push(vec![]),
+                        None => {}
+                    }
+                }
+                for r in runs.iter().filter(|r| r.len() > 1) {
+                    plot_painter.add(egui::Shape::dashed_line(r, Stroke::new(2.0_f32, crate::mapview::ZONE_COLOR), 6.0, 3.0));
+                }
+                if let Some(f) = runs.iter().find(|r| r.len() > 1).map(|r| r[0]) {
+                    plot_painter.text(f + egui::vec2(4.0, 4.0), Align2::LEFT_TOP, &z.name, FontId::proportional(10.5), crate::mapview::ZONE_COLOR);
+                }
+            }
+        }
+        // Layer picks of crossing profiles, where they cross this one (read-only).
+        if self.show_crossings {
+            let mut hovered = None;
+            for c in crate::interp::crossing_picks(&self.profiles, &self.lines, &self.crossings.1, pid) {
+                let pos = line_pt(c.trace, c.time_ns);
+                if !plot.contains(pos) {
+                    continue;
+                }
+                let col = self.marker_types.get(c.type_idx).map(|t| c32(t.color)).unwrap_or(Color32::WHITE);
+                plot_painter.circle(pos, 4.0, col, Stroke::new(1.0_f32, Color32::BLACK));
+                plot_painter.text(pos + egui::vec2(6.0, -5.0), Align2::LEFT_BOTTOM, &c.label, FontId::proportional(10.0), Color32::from_rgb(255, 255, 160));
+                if hover_pos.is_some_and(|h| h.distance(pos) < 7.0) {
+                    hovered = Some(c);
+                }
+            }
+            if let Some(c) = hovered {
+                let tname = self.marker_types.get(c.type_idx).map(|t| t.name.clone()).unwrap_or_default();
+                egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), egui::Id::new("crossing_pick"), |ui| {
+                    ui.label(format!("{}  pick #{}  {tname}\nt {:.2} ns here  ·  depth {:.3} m", c.from_name, c.line_id, c.time_ns, c.depth_m));
+                });
+            }
+        }
         for m in self.markers.iter().filter(|m| m.profile_id == pid) {
             let Some(t) = self.marker_types.get(m.type_idx) else { continue };
             let pos = marker_pos(m);
@@ -669,6 +715,8 @@ impl App {
             }
         }
         let (enter, backspace, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Backspace), i.key_pressed(egui::Key::Escape)));
+        // Enter / Esc belong to the map while a zone polygon is drawn.
+        let (enter, esc) = (enter && self.zone_draw.is_none(), esc && self.zone_draw.is_none());
         if enter {
             if self.hyperbola.is_some() {
                 self.save_hyperbola();

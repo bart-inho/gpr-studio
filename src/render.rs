@@ -10,6 +10,8 @@ pub enum ColorMap {
     RedWhiteBlue,
     Seismic,
     Rainbow,
+    /// Interpolation maps only (not in `ALL`, the radargram list).
+    Jet,
 }
 
 impl ColorMap {
@@ -21,6 +23,7 @@ impl ColorMap {
             ColorMap::RedWhiteBlue => "Red-white-blue",
             ColorMap::Seismic => "Seismic",
             ColorMap::Rainbow => "Rainbow",
+            ColorMap::Jet => "Jet",
         }
     }
     /// v in [-1, 1]
@@ -51,6 +54,10 @@ impl ColorMap {
             }
             ColorMap::Rainbow => {
                 let stops = [(0.0, [0, 0, 140]), (0.2, [0, 80, 255]), (0.4, [0, 230, 230]), (0.6, [120, 255, 60]), (0.8, [255, 200, 0]), (1.0, [200, 0, 0])];
+                grad(&stops, u)
+            }
+            ColorMap::Jet => {
+                let stops = [(0.0, [0, 0, 143]), (0.125, [0, 0, 255]), (0.375, [0, 255, 255]), (0.625, [255, 255, 0]), (0.875, [255, 0, 0]), (1.0, [128, 0, 0])];
                 grad(&stops, u)
             }
         }

@@ -1,4 +1,4 @@
-//! GeoPackage export (OGC GeoPackage 1.2): profiles, point markers, layer picks and trace points.
+//! GeoPackage export (OGC GeoPackage 1.2): profiles, point markers, layer picks, trace points and interpolations.
 
 use crate::crs::CrsSpec;
 use rusqlite::{params, Connection};
@@ -10,6 +10,7 @@ pub struct ExportOptions {
     pub layers: bool,
     pub trace_points: bool,
     pub trace_step: usize,
+    pub interpolations: bool,
 }
 
 pub struct ProfileRow {
@@ -55,6 +56,16 @@ pub struct LineRow {
     pub pts: Vec<[f64; 6]>,
 }
 
+pub struct ZoneRow {
+    pub name: String,
+    pub pick_type: String,
+    pub polygon: Vec<[f64; 2]>,
+    /// Non-empty cells: (x, y, time ns, depth m, altitude m).
+    pub cells: Vec<[f64; 5]>,
+    pub max_radius_m: f64,
+    pub cell_size_m: f64,
+}
+
 fn geom_blob(srs: i32, wkb_type: u32, pts: &[[f64; 3]], z: bool) -> Vec<u8> {
     let mut b = Vec::with_capacity(64 + pts.len() * 24);
     b.extend_from_slice(b"GP");
@@ -74,7 +85,10 @@ fn geom_blob(srs: i32, wkb_type: u32, pts: &[[f64; 3]], z: bool) -> Vec<u8> {
     b.push(1);
     let t = if z { wkb_type + 1000 } else { wkb_type };
     b.extend_from_slice(&t.to_le_bytes());
-    if wkb_type == 2 {
+    if wkb_type == 3 {
+        b.extend_from_slice(&1u32.to_le_bytes()); // one ring
+    }
+    if wkb_type == 2 || wkb_type == 3 {
         b.extend_from_slice(&(pts.len() as u32).to_le_bytes());
     }
     for p in pts {
@@ -94,7 +108,7 @@ fn srs_id(crs: &CrsSpec) -> i32 {
     }
 }
 
-pub fn export(path: &Path, crs: &CrsSpec, opt: &ExportOptions, profiles: &[ProfileRow], markers: &[MarkerRow], lines: &[LineRow]) -> Result<String, String> {
+pub fn export(path: &Path, crs: &CrsSpec, opt: &ExportOptions, profiles: &[ProfileRow], markers: &[MarkerRow], lines: &[LineRow], zones: &[ZoneRow]) -> Result<String, String> {
     if path.exists() {
         std::fs::remove_file(path).map_err(|e| format!("cannot replace {}: {e}", path.display()))?;
     }
@@ -218,6 +232,34 @@ pub fn export(path: &Path, crs: &CrsSpec, opt: &ExportOptions, profiles: &[Profi
         register(&tx, "layer_picks", "LINESTRING", "GPR layer picks (elevation = surface - depth)", ext).map_err(e)?;
         register(&tx, "layer_pick_vertices", "POINT", "GPR layer pick vertices", ext).map_err(e)?;
         summary.push(format!("{n} layer picks"));
+    }
+    if opt.interpolations {
+        tx.execute_batch("CREATE TABLE interpolations (fid INTEGER PRIMARY KEY AUTOINCREMENT, geom POINT, zone TEXT, pick_type TEXT, time_ns REAL, depth_m REAL, altitude_m REAL, max_radius_m REAL, cell_size_m REAL)").map_err(e)?;
+        tx.execute_batch("CREATE TABLE interpolation_zones (fid INTEGER PRIMARY KEY AUTOINCREMENT, geom POLYGON, zone TEXT, pick_type TEXT)").map_err(e)?;
+        let (mut ext, mut zext) = (empty, empty);
+        let mut n = 0;
+        for z in zones {
+            for c in &z.cells {
+                let p = [c[0], c[1], c[4]];
+                extent(&[p], &mut ext);
+                tx.execute(
+                    "INSERT INTO interpolations (geom, zone, pick_type, time_ns, depth_m, altitude_m, max_radius_m, cell_size_m) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                    params![geom_blob(srs, 1, &[p], true), z.name, z.pick_type, c[2], c[3], c[4], z.max_radius_m, z.cell_size_m],
+                )
+                .map_err(e)?;
+                n += 1;
+            }
+            if z.polygon.len() >= 3 {
+                let ring: Vec<[f64; 3]> = z.polygon.iter().chain(z.polygon.first()).map(|q| [q[0], q[1], 0.0]).collect();
+                extent(&ring, &mut zext);
+                tx.execute("INSERT INTO interpolation_zones (geom, zone, pick_type) VALUES (?1,?2,?3)", params![geom_blob(srs, 3, &ring, false), z.name, z.pick_type]).map_err(e)?;
+            }
+        }
+        register(&tx, "interpolations", "POINT", "IDW interpolation cells of layer picks (z = altitude)", ext).map_err(e)?;
+        register(&tx, "interpolation_zones", "POLYGON", "Interpolation zone outlines", zext).map_err(e)?;
+        // The outlines are 2D.
+        tx.execute("UPDATE gpkg_geometry_columns SET z = 0 WHERE table_name = 'interpolation_zones'", []).map_err(e)?;
+        summary.push(format!("{n} interpolation cells"));
     }
     tx.commit().map_err(e)?;
     Ok(summary.join(", "))

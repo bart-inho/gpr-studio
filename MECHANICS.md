@@ -61,6 +61,24 @@ in the toolbar (other types are kept and the status line says so). Ctrl+Z undoes
 A layer line ends with a double-click (or Enter); the next click starts a new line. With Snap = None the
 phase follow draws straight between clicks (no snapping at all).
 
+## Crossing picks and interpolation zones
+Crossings: every intersection of two GPS tracks (x/y segments in the project CRS; track and 32-segment bounding boxes
+first). Profiles with the same map number (channels `_0`/`_1` of one line) are not crossings. The fractional trace
+on each profile is linear along the crossing segment; the list is recomputed only when coordinates change.
+A layer pick of P1 is shown on P2 when it covers the crossing trace (linear between its two neighbouring vertices,
+no extrapolation): depth d = v₁·t₁/2, then t₂ = 2d/v₂, drawn like a P2 pick (depth axis, topography, reversed
+display). Depth-matched, not elevation-matched: at one point both profiles share the surface.
+
+Interpolation (IDW): input points are the vertices of the zone's pick type inside the polygon (even–odd rule),
+densified along the profile every ≈ cell size, each with depth d = v·t/2 and altitude z = GPS height − d.
+Cells are the cell-size grid over the polygon's bounding box, kept inside the polygon. For a cell, with the
+points i within the **max radius** R (distance rᵢ), wᵢ = 1/rᵢᵖ (p = power, default 2):
+depth = Σwᵢdᵢ/Σwᵢ and altitude = Σwᵢzᵢ/Σwᵢ (separately), v_mean = Σwᵢvᵢ/Σwᵢ, time = 2·depth/v_mean.
+A point at the cell centre gives its own value; no point within R leaves the cell empty (only gaps between
+picks are filled). Defaults: R = 5 m, cell 0.25 m, power 2. On a profile the surface is sampled at each trace
+position (bilinear between the 4 neighbouring cells, nearest cell when one is empty) and drawn at t = 2·depth/v
+of that profile. Map raster: Jet from the zone's minimum to maximum depth, 70 % opacity, empty cells transparent.
+
 ## Background work
 Processing, file import and opening a project run on a background thread. The status bar shows a progress bar at
 once; after 2 s a popup shows the job, the current profile and step, a progress bar, the time left and Cancel.
@@ -87,6 +105,8 @@ the left axis is time below the highest point, the right axis elevation = z_max 
 ## Exports
 GeoPackage 1.2 (application_id 0x47504B47, user_version 10200): `profiles` (LineStringZ), `trace_points`, `markers` (PointZ),
 `layer_picks` (LineStringZ, elevation = surface − depth) and `layer_pick_vertices`; SRS = project CRS (WKT from the EPSG table).
+`interpolations` (PointZ, one row per non-empty cell, z = altitude: zone, pick_type, time_ns, depth_m, altitude_m,
+max_radius_m, cell_size_m) and `interpolation_zones` (Polygon, 2D). Points rather than a raster tile table: QGIS styles them with any ramp.
 PDF: A4/A3 landscape; per page radargram section + GPS map framed to the whole survey, with the current profile and section highlighted + tables. The optional 1×1 metre scale is on by default: it keeps the chosen metres per page, uses equal horizontal and vertical metre scales when the depth fits, and compresses the vertical scale when needed to show the full depth. Whole-profile pages use the full vertical range; visible-section pages keep the current vertical view.
 
 ## Topographic Kirchhoff migration

@@ -13,6 +13,10 @@ picking, mapping and reporting. Written in Rust with egui; runs on Windows, macO
   GeoTIFF basemaps of any size, any output coordinate system (EPSG code or PROJ string; default EPSG:2056).
   The map sits on the right, at the bottom of the main window (full width for long profiles) or in its own
   window (buttons in the map header, or the Map menu); the choice is kept for the next start.
+  **Interpolation zones** (left panel, under Picks): *New zone* draws a polygon on the map (left click adds a
+  vertex, a drag still pans, right click or Enter closes, Esc cancels); *Interpolate* fills it with an
+  inverse-distance-weighted surface of one layer-pick type, shown as a Jet-coloured depth raster with a legend.
+  Cells farther than *Max radius* from every pick stay empty, so only the space between picks is filled.
 - **Processing** – set time zero, dewow, DC shift, background removal, bandpass (FFT and Butterworth),
   AGC (optionally with the gain smoothed over neighbouring traces), energy decay, gain function,
   divergence compensation, trace normalisation (90th percentile of absolute amplitude per trace), running (moving) average over traces, average xy-filter,
@@ -28,7 +32,11 @@ picking, mapping and reporting. Written in Rust with egui; runs on Windows, macO
   only changes the horizontal span (around the current centre) so that one metre is as long horizontally
   as vertically; time sections use the toolbar velocity. A profile too short to fill the width is drawn narrower.
 - **Picking** – typed point markers, hyperbola velocity fitting, layer lines with phase following and snapping; Ctrl+Z undoes picking steps and deletions.
-- **Export** – GeoPackage (profiles, markers, layer picks, trace points), SEG-Y of chosen processing steps,
+  **Show crossing picks** (on by default): where another profile crosses this one, its layer picks appear as a dot
+  labelled `p<profile number>` at the same depth (hover for the profile, pick and depth). Interpolated zones are
+  drawn on every profile they cover as a pink dashed line. Both are read-only.
+- **Export** – GeoPackage (profiles, markers, layer picks, trace points, interpolation cells as points with
+  time/depth/altitude and the zone outlines), SEG-Y of chosen processing steps,
   PDF report (the top three quarters for the radargram, with optional exact 1×1 metre scale and a minimum section width; the bottom quarter split equally between the whole-survey map, profile details, and processing), CSV of picks.
 - **Projects** – `.gprproj` files keep the file list, processing, GPS, picks, CRS and basemaps.
   Ctrl+S saves to the project's file, File › Open last project reopens the previous one, and closing only
