@@ -5,6 +5,7 @@ use crate::app::{App, PdfRange};
 use crate::draw::{fmt_tick, nice_step};
 use crate::model::{Profile, Symbol};
 use crate::pdf::{Page, Pdf};
+use crate::processing::Step;
 
 const ORANGE: [u8; 3] = [255, 140, 0];
 const BLUE: [u8; 3] = [25, 85, 220];
@@ -62,6 +63,32 @@ fn label(pg: &mut Page, x: f32, y: f32, size: f32, text: &str, bold: bool, col: 
     pg.text(x, y, size, text, bold);
 }
 
+struct MapLabel {
+    x: f32,
+    y: f32,
+    size: f32,
+    text: String,
+    color: [u8; 3],
+    number: f64,
+    kind: u8,
+}
+
+fn visible_map_labels(mut labels: Vec<MapLabel>, x: f32, y: f32, w: f32, h: f32, blocked: &[[f32; 4]]) -> Vec<MapLabel> {
+    labels.sort_by(|a, b| a.number.total_cmp(&b.number).then(a.kind.cmp(&b.kind)));
+    let mut placed = Vec::new();
+    let mut boxes: Vec<[f32; 4]> = blocked.to_vec();
+    for mut l in labels {
+        let width = crate::pdf::text_width(&l.text, l.size);
+        l.x = l.x.clamp(x + 2.0, (x + w - width - 2.0).max(x + 2.0));
+        l.y = l.y.clamp(y + l.size + 2.0, (y + h - 2.0).max(y + l.size + 2.0));
+        let r = [l.x - 2.0, l.y - l.size - 2.0, l.x + width + 2.0, l.y + 2.0];
+        if boxes.iter().any(|b| r[0] < b[2] && r[2] > b[0] && r[1] < b[3] && r[3] > b[1]) { continue; }
+        boxes.push(r);
+        placed.push(l);
+    }
+    placed
+}
+
 /// Trace ranges (one per page) for a profile.
 fn ranges(app: &App, p: &Profile) -> Vec<(f32, f32)> {
     let n = p.proc.ntr as f32;
@@ -76,7 +103,7 @@ fn ranges(app: &App, p: &Profile) -> Vec<(f32, f32)> {
         PdfRange::Whole => vec![(0.0, n)],
         PdfRange::Chunks => {
             let len = p.axis_length().max(1e-6);
-            let step = app.pdf_opts.chunk_m.max(0.5) as f64;
+            let step = app.pdf_opts.chunk_m.max(minimum_section_width(app)).max(1.0) as f64;
             let mut out = Vec::new();
             let mut d = 0.0;
             while d < len - 1e-6 {
@@ -91,6 +118,151 @@ fn ranges(app: &App, p: &Profile) -> Vec<(f32, f32)> {
             if p.reverse_display { out.reverse(); }
             out
         }
+    }
+}
+
+fn survey_bounds(app: &App) -> Option<(f64, f64, f64, f64)> {
+    let mut bounds: Option<(f64, f64, f64, f64)> = None;
+    for c in app.profiles.iter().flat_map(|p| &p.coords) {
+        if !c[0].is_finite() || !c[1].is_finite() { continue; }
+        bounds = Some(match bounds {
+            Some((x0, y0, x1, y1)) => (x0.min(c[0]), y0.min(c[1]), x1.max(c[0]), y1.max(c[1])),
+            None => (c[0], c[1], c[0], c[1]),
+        });
+    }
+    bounds
+}
+
+fn radargram_height(full: f32, width: f32, span_m: f64, depth_m: f32, one_to_one: bool) -> (f32, f64) {
+    let ideal = depth_m as f64 * width as f64 / span_m.max(1e-9);
+    let height = if one_to_one && ideal.is_finite() && ideal > 0.0 { (ideal as f32).min(full) } else { full };
+    (height, ideal)
+}
+
+fn page_geometry(a3: bool) -> (f32, f32, f32, f32, f32, f32, f32) {
+    let (pw, ph) = if a3 { (1190.55, 841.89) } else { (841.89, 595.28) };
+    let k = pw / 841.89;
+    let m = 26.0;
+    let gx = m + 34.0 * k;
+    let gy = 56.0 * k;
+    let gw = pw - gx - m - 40.0 * k;
+    let map_h = ph * 0.25;
+    let gh = ph - gy - 32.0 * k - map_h - m - 4.0;
+    (pw, ph, gx, gy, gw, gh, map_h)
+}
+
+pub fn minimum_section_width(app: &App) -> f32 {
+    if !app.pdf_opts.one_to_one { return 1.0; }
+    let (_, _, _, _, gw, gh, _) = page_geometry(app.pdf_opts.a3);
+    let profiles: Vec<&Profile> = if app.pdf_opts.all_profiles { app.profiles.iter().collect() } else { app.active_profile().into_iter().collect() };
+    let minimum = profiles.into_iter().map(|p| {
+        let (s0, s1) = vertical_range(app, p);
+        let metres_per_sample = if p.proc.depth_axis { p.proc.dt } else { p.depth_of_time(p.proc.dt) };
+        ((s1 - s0).max(0.0) * metres_per_sample * gw / gh).max(1.0)
+    }).fold(1.0f32, f32::max);
+    if minimum.is_finite() { (minimum * 10.0).ceil() / 10.0 } else { 1.0 }
+}
+
+fn vertical_range(app: &App, p: &Profile) -> (f32, f32) {
+    if app.pdf_opts.one_to_one {
+        (0.0, p.proc.ns as f32)
+    } else {
+        app.views.get(&p.id).map(|v| (v.s0, v.s1)).unwrap_or((0.0, p.proc.ns as f32))
+    }
+}
+
+#[cfg(test)]
+mod report_layout_tests {
+    use super::*;
+
+    #[test]
+    fn crowded_map_keeps_the_lower_number() {
+        let labels = vec![
+            MapLabel { x: 20.0, y: 20.0, size: 8.0, text: "12".into(), color: BLUE, number: 12.0, kind: 0 },
+            MapLabel { x: 20.0, y: 20.0, size: 8.0, text: "3".into(), color: BLUE, number: 3.0, kind: 1 },
+            MapLabel { x: 80.0, y: 20.0, size: 8.0, text: "20 m".into(), color: BLUE, number: 20.0, kind: 2 },
+        ];
+        let visible = visible_map_labels(labels, 0.0, 0.0, 120.0, 60.0, &[]);
+        assert_eq!(visible.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), vec!["3", "20 m"]);
+    }
+
+    #[test]
+    fn map_bounds_include_every_survey_profile() {
+        let mut app = App::headless(vec![], None);
+        let mut profiles = crate::demo::make();
+        app.add_profile(profiles.remove(0));
+        app.add_profile(profiles.remove(0));
+        app.profiles[0].coords = vec![[0.0, 0.0, 0.0], [10.0, 5.0, 0.0]];
+        app.profiles[1].coords = vec![[-40.0, 20.0, 0.0], [20.0, 60.0, 0.0]];
+        assert_eq!(survey_bounds(&app), Some((-40.0, 0.0, 20.0, 60.0)));
+    }
+
+    #[test]
+    fn survey_extent_stays_above_scale_bar_strip() {
+        let mf = survey_map_frame((0.0, 0.0, 100.0, 80.0), 0.0, 0.0, 400.0, 150.0, 1.0);
+        for (x, y) in [(0.0, 0.0), (100.0, 0.0), (0.0, 80.0), (100.0, 80.0)] {
+            let p = mf.to_page(x, y);
+            assert!((0.0..=400.0).contains(&p[0]));
+            assert!(p[1] >= 0.0 && p[1] <= 150.0 - 26.0);
+        }
+    }
+
+    #[test]
+    fn one_to_one_keeps_page_length_and_full_depth() {
+        let (height, ideal) = radargram_height(250.0, 700.0, 20.0, 5.0, true);
+        assert_eq!(height, 175.0);
+        assert_eq!(height as f64 / 5.0, 700.0 / 20.0);
+        assert_eq!(ideal, 175.0);
+        let (height, ideal) = radargram_height(250.0, 700.0, 20.0, 10.0, true);
+        assert_eq!(height, 250.0);
+        assert_eq!(ideal, 350.0);
+    }
+
+    #[test]
+    fn one_to_one_enforces_minimum_section_width_with_quarter_page_map() {
+        let mut app = App::headless(vec![], None);
+        let mut profile = crate::demo::make().remove(0);
+        profile.velocity = 0.5;
+        app.add_profile(profile);
+        app.pdf_opts.range = PdfRange::Chunks;
+        app.pdf_opts.chunk_m = 5.0;
+        let (_, ph, _, _, gw, gh, map_h) = page_geometry(false);
+        assert!(map_h <= ph * 0.25);
+        let minimum = minimum_section_width(&app);
+        assert!(minimum > 5.0);
+        let (s0, s1) = vertical_range(&app, &app.profiles[0]);
+        let depth = (s1 - s0) * app.profiles[0].depth_of_time(app.profiles[0].proc.dt);
+        let (height, ideal) = radargram_height(gh, gw, minimum as f64, depth, true);
+        assert!(ideal <= gh as f64 + 0.01);
+        assert!((height as f64 / depth as f64 - gw as f64 / minimum as f64).abs() < 0.01);
+        assert_eq!(ranges(&app, &app.profiles[0]).len(), 2);
+        let path = std::path::Path::new("target/report-exact-ratio.pdf");
+        assert_eq!(export(&app, path).unwrap(), 2);
+    }
+
+    #[test]
+    fn report_keeps_survey_map_when_active_profile_has_no_gps() {
+        let mut app = App::headless(vec![], None);
+        for p in crate::demo::make().into_iter().take(2) { app.add_profile(p); }
+        app.profiles[0].coords.clear();
+        app.active = Some(0);
+        let path = std::path::Path::new("target/report-map-no-gps.pdf");
+        assert_eq!(export(&app, path).unwrap(), 1);
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn whole_profile_one_to_one_keeps_full_vertical_range() {
+        let mut app = App::headless(vec![], None);
+        let id = app.add_profile(crate::demo::make().remove(0));
+        let ns = app.profiles[0].proc.ns as f32;
+        app.views.insert(id, crate::app::ViewState { tr0: 0.0, tr1: 10.0, s0: 20.0, s1: 30.0 });
+        app.pdf_opts.range = PdfRange::Chunks;
+        assert_eq!(vertical_range(&app, &app.profiles[0]), (0.0, ns));
+        app.pdf_opts.range = PdfRange::Visible;
+        assert_eq!(vertical_range(&app, &app.profiles[0]), (0.0, ns));
+        app.pdf_opts.one_to_one = false;
+        assert_eq!(vertical_range(&app, &app.profiles[0]), (20.0, 30.0));
     }
 }
 
@@ -111,6 +283,16 @@ impl MapFrame {
     fn to_world(&self, px: f32, py: f32) -> [f64; 2] {
         [self.cx + (px - self.x - self.w / 2.0) as f64 * self.scale, self.cy - (py - self.y - self.h / 2.0) as f64 * self.scale]
     }
+}
+
+fn survey_map_frame(bounds: (f64, f64, f64, f64), x: f32, y: f32, w: f32, h: f32, k: f32) -> MapFrame {
+    let (x0, y0, x1, y1) = bounds;
+    // Leave a map strip as tall as the scale bar below the entire survey.
+    let reserve = 26.0 * k;
+    let span = (x1 - x0).max(y1 - y0).max(5.0);
+    let scale = ((x1 - x0).max(span * 0.3) / w as f64)
+        .max((y1 - y0).max(span * 0.3) / (h - reserve).max(1.0) as f64) * 1.25;
+    MapFrame { x, y, w, h, cx: (x0 + x1) / 2.0, cy: (y0 + y1) / 2.0 - reserve as f64 * scale / 2.0, scale }
 }
 
 /// Render the visible basemaps into an RGB image covering the map frame.
@@ -173,7 +355,9 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
     if profiles.is_empty() {
         return Err("no profile to export".into());
     }
-    let (pw, ph) = if app.pdf_opts.a3 { (1190.55, 841.89) } else { (841.89, 595.28) };
+    let (pw, ph, gx, gy, gw_full, gh_full, map_h) = page_geometry(app.pdf_opts.a3);
+    let minimum_width = minimum_section_width(app) as f64;
+    let map_bounds = survey_bounds(app);
     let mut pdf = Pdf::new();
     let mut jobs = Vec::new();
     for p in &profiles {
@@ -197,10 +381,6 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
         pg.text_right(pw - m, 20.0 * k, 9.0 * k, &format!("{}  ·  {}  ·  page {}/{}", date, app.project_crs.short(), pi + 1, total), false);
 
         // ---------------------------------------------------------- radargram
-        let gx = m + 34.0 * k;
-        let gy = 30.0 * k + 26.0 * k;
-        let gw_full = pw - gx - m - 40.0 * k;
-        let gh = ph * 0.42;
         // Horizontal scale. "One page every N m": N metres always fill the frame, so every page and
         // every profile has the same scale and a shorter last part leaves the rest of the frame blank.
         let ntr_page = (tr1 - tr0).max(1.0);
@@ -208,14 +388,16 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
         let d_last = p.axis_dist_at((tr1 - 1.0).max(tr0));
         let dx_avg = if ntr_page > 1.0 { ((d_last - d_first) / (ntr_page as f64 - 1.0)).max(1e-9) } else { p.dx as f64 };
         let page_len = ntr_page as f64 * dx_avg; // metres covered by the traces of this page
-        let span_m = if app.pdf_opts.range == PdfRange::Chunks { (app.pdf_opts.chunk_m as f64).max(page_len.min(app.pdf_opts.chunk_m as f64 * 1.05)) } else { page_len };
+        let span_m = if app.pdf_opts.range == PdfRange::Chunks { (app.pdf_opts.chunk_m as f64).max(minimum_width).max(page_len) } else { page_len.max(minimum_width) };
         let scale = gw_full as f64 / span_m.max(1e-9); // points per metre
         let gw = ((page_len * scale) as f32).clamp(4.0, gw_full);
+        let (s0, s1) = vertical_range(app, p);
+        let metres_per_sample = if p.proc.depth_axis { p.proc.dt } else { p.depth_of_time(p.proc.dt) };
+        let depth_m = (s1 - s0).max(0.0) * metres_per_sample;
+        let (gh, ideal_height) = radargram_height(gh_full, gw_full, span_m, depth_m, app.pdf_opts.one_to_one);
         let res = 2.4f32;
         let (iw, ih) = (((gw * res) as usize).clamp(200, 4000), ((gh * res) as usize).clamp(100, 2400));
         let clip = crate::render::clip_level(&p.proc, 1.0) / app.contrast.max(0.01);
-        let view = app.views.get(&p.id);
-        let (s0, s1) = view.map(|v| (v.s0, v.s1)).unwrap_or((0.0, p.proc.ns as f32));
         let rgba = crate::render::render(&p.proc, tr0, tr1, s0, s1, iw, ih, app.colormap, clip);
         let mut rgb = Vec::with_capacity(iw * ih * 3);
         for row in rgba.chunks_exact(iw * 4) {
@@ -303,16 +485,23 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
             }
             d += step;
         }
-        let scale_note = if app.pdf_opts.range == PdfRange::Chunks { format!("distance [m]  ·  {:.0} m per page width", span_m) } else { "distance [m]".to_string() };
+        let mut scale_note = if app.pdf_opts.range == PdfRange::Chunks { format!("distance [m]  ·  {:.0} m per page width", span_m) } else { "distance [m]".to_string() };
+        if app.pdf_opts.one_to_one {
+            if ideal_height.is_finite() && ideal_height > gh_full as f64 {
+                scale_note.push_str(&format!("  ·  vertical compressed ×{:.2}", ideal_height / gh_full as f64));
+            } else if ideal_height.is_finite() && ideal_height > 0.0 {
+                scale_note.push_str("  ·  1×1 m");
+            }
+        }
         pg.text_center(gx + gw_full / 2.0, gy + gh + 22.0 * k, fs, &scale_note, false);
         // Picks on the radargram
-        if app.pdf_opts.markers && p.proc.depth_datum_m.is_none() {
+        if app.pdf_opts.markers {
             pg.save();
             pg.clip_rect(gx, gy, gw, gh);
-            let sample_of_t = |t: f32| p.proc.sample_of(if depth_sec { p.depth_of_time(t) } else { t });
+            let sample_of_t = |tr: f32, t: f32| p.proc.sample_of(p.y_of_pick_time(tr, t));
             for l in app.lines.iter().filter(|l| l.profile_id == p.id) {
                 let Some(t) = app.marker_types.get(l.type_idx) else { continue };
-                let pts: Vec<[f32; 2]> = l.points.iter().map(|(tr, tt)| [x_of(*tr), y_of(sample_of_t(*tt))]).collect();
+                let pts: Vec<[f32; 2]> = l.points.iter().map(|(tr, tt)| [x_of(*tr), y_of(sample_of_t(*tr, *tt))]).collect();
                 pg.stroke_color([255, 255, 255]);
                 pg.line_width(2.6);
                 pg.polyline(&pts);
@@ -322,7 +511,7 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
             }
             for mk in app.markers.iter().filter(|mk| mk.profile_id == p.id && mk.trace >= tr0 && mk.trace <= tr1) {
                 let Some(t) = app.marker_types.get(mk.type_idx) else { continue };
-                let (x, y) = (x_of(mk.trace), y_of(sample_of_t(mk.time_ns)));
+                let (x, y) = (x_of(mk.trace), y_of(sample_of_t(mk.trace, mk.time_ns)));
                 pdf_symbol(&mut pg, x, y, 3.6 * k, t.symbol, t.color);
                 pg.fill_color([255, 255, 0]);
                 pg.text(x + 5.0, y - 4.0, 7.0 * k, &format!("#{}", mk.id), true);
@@ -332,24 +521,14 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
 
         // ---------------------------------------------------------- map
         let my = gy + gh + 32.0 * k;
-        let mh = ph - my - m - 4.0;
+        let mh = map_h;
         let mw = (pw - 2.0 * m) * 0.54;
         let mx = m;
-        let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-        for c in &p.coords {
-            x0 = x0.min(c[0]);
-            x1 = x1.max(c[0]);
-            y0 = y0.min(c[1]);
-            y1 = y1.max(c[1]);
-        }
         pg.stroke_color([0, 0, 0]);
         pg.line_width(0.8);
-        if x0 <= x1 {
-            let span = (x1 - x0).max(y1 - y0).max(5.0);
-            let cx = (x0 + x1) / 2.0;
-            let cy = (y0 + y1) / 2.0;
-            let scale = ((x1 - x0).max(span * 0.3) / mw as f64).max((y1 - y0).max(span * 0.3) / mh as f64) * 1.25;
-            let mf = MapFrame { x: mx, y: my, w: mw, h: mh, cx, cy, scale };
+        if let Some((x0, y0, x1, y1)) = map_bounds {
+            let mf = survey_map_frame((x0, y0, x1, y1), mx, my, mw, mh, k);
+            let scale = mf.scale;
             if app.pdf_opts.basemap {
                 let (bw, bh) = ((mw * 2.4) as usize, (mh * 2.4) as usize);
                 if let Some(bimg) = basemap_image(app, &mf, bw, bh) {
@@ -365,6 +544,7 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
             }
             pg.save();
             pg.clip_rect(mx, my, mw, mh);
+            let mut map_labels = Vec::new();
             // Coordinate grid
             let gstep = nice_step(mw as f64 * scale, 4.0);
             pg.stroke_color([150, 150, 150]);
@@ -395,10 +575,12 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
                 pg.line_width(0.9);
                 pg.polyline(&pts);
                 if let Some(s) = pts.first() {
-                    label(&mut pg, s[0] + 3.0, s[1] - 3.0, 6.5 * k, &crate::model::short_label(&q.name), false, [60, 60, 60]);
+                    let number = crate::model::short_label(&q.name);
+                    map_labels.push(MapLabel { x: s[0] + 3.0, y: s[1] - 3.0, size: 6.5 * k, number: number.parse().unwrap_or(f64::INFINITY), text: number, color: [60, 60, 60], kind: 1 });
                 }
             }
             // This profile + highlighted section
+            if !p.coords.is_empty() {
             let pts: Vec<[f32; 2]> = p.coords.iter().step_by((p.coords.len() / 2000).max(1)).map(|c| mf.to_page(c[0], c[1])).collect();
             pg.stroke_color([255, 255, 255]);
             pg.line_width(3.0);
@@ -417,7 +599,9 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
             if let Some(s) = pts.first() {
                 pg.fill_color(BLUE);
                 pg.circle(s[0], s[1], 2.6, true, false);
-                label(&mut pg, s[0] + 4.0, s[1] - 4.0, 7.5 * k, &format!("{} (start)", crate::model::short_label(&p.name)), true, BLUE);
+                let number = crate::model::short_label(&p.name);
+                let ly = if s[1] > my + mh - 26.0 { s[1] - 30.0 } else { s[1] - 4.0 };
+                map_labels.push(MapLabel { x: s[0] + 4.0, y: ly, size: 7.5 * k, number: number.parse().unwrap_or(f64::INFINITY), text: format!("{number} (start)"), color: BLUE, kind: 0 });
             }
             // Distance ticks along the track
             let tstep = nice_step(p.length(), 6.0);
@@ -427,9 +611,10 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
                 if let Some(c) = p.coord_at(p.trace_at_dist(dd)) {
                     let q = mf.to_page(c[0], c[1]);
                     pg.circle(q[0], q[1], 1.3, true, false);
-                    label(&mut pg, q[0] + 3.0, q[1] + 8.0, 6.0 * k, &format!("{dd:.0} m"), false, [0, 0, 0]);
+                    map_labels.push(MapLabel { x: q[0] + 3.0, y: q[1] + 8.0, size: 6.0 * k, number: dd, text: format!("{dd:.0} m"), color: [0, 0, 0], kind: 2 });
                 }
                 dd += tstep;
+            }
             }
             if app.pdf_opts.markers {
                 for l in app.lines.iter().filter(|l| l.profile_id == p.id) {
@@ -447,9 +632,20 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
                     if let Some(c) = q.coord_at(mk.trace) {
                         let s = mf.to_page(c[0], c[1]);
                         pdf_symbol(&mut pg, s[0], s[1], 3.0 * k, t.symbol, t.color);
-                        label(&mut pg, s[0] + 4.0, s[1] + 7.0, 6.5 * k, &format!("#{}", mk.id), false, [0, 0, 0]);
+                        map_labels.push(MapLabel { x: s[0] + 4.0, y: s[1] + 7.0, size: 6.5 * k, number: mk.id as f64, text: format!("#{}", mk.id), color: [0, 0, 0], kind: 3 });
                     }
                 }
+            }
+            let geo = app.is_geographic();
+            let m_per_unit = if geo { 111_320.0 * ((y0 + y1) / 2.0).to_radians().cos().max(0.01) } else { 1.0 };
+            let bar_m = nice_step(mw as f64 * 0.25 * scale * m_per_unit, 1.0);
+            let bar_pt = (bar_m / m_per_unit / scale) as f32;
+            let bx = mx + 8.0;
+            let by = my + mh - 10.0;
+            let (nx, ny) = (mx + mw - 16.0, my + 14.0);
+            let blocked = [[bx - 4.0, by - 12.0, bx + bar_pt + 46.0, by + 6.0], [nx - 7.0, ny - 9.0, nx + 7.0, ny + 22.0]];
+            for l in visible_map_labels(map_labels, mx, my, mw, mh, &blocked) {
+                pg.text_halo(l.x, l.y, l.size, &l.text, l.kind == 0, l.color);
             }
             pg.restore();
             pg.stroke_color([0, 0, 0]);
@@ -465,20 +661,11 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
                 }
             }
             // Scale bar
-            let geo = app.is_geographic();
-            let m_per_unit = if geo { 111_320.0 * cy.to_radians().cos().max(0.01) } else { 1.0 };
-            let bar_m = nice_step(mw as f64 * 0.25 * scale * m_per_unit, 1.0);
-            let bar_pt = (bar_m / m_per_unit / scale) as f32;
-            let bx = mx + 8.0;
-            let by = my + mh - 10.0;
-            pg.fill_color([255, 255, 255]);
-            pg.rect(bx - 4.0, by - 12.0, bar_pt + 50.0, 18.0, true, false);
             pg.fill_color([0, 0, 0]);
             pg.rect(bx, by - 3.0, bar_pt / 2.0, 3.0, true, false);
             pg.rect(bx, by - 3.0, bar_pt, 3.0, false, true);
-            pg.text(bx + bar_pt + 4.0, by, 7.0 * k, &if bar_m >= 1.0 { format!("{bar_m:.0} m") } else { format!("{bar_m:.2} m") }, false);
+            pg.text_halo(bx + bar_pt + 4.0, by, 7.0 * k, &if bar_m >= 1.0 { format!("{bar_m:.0} m") } else { format!("{bar_m:.2} m") }, false, [0, 0, 0]);
             // North arrow
-            let (nx, ny) = (mx + mw - 16.0, my + 14.0);
             pg.fill_color([0, 0, 0]);
             pg.polygon(&[[nx, ny - 8.0], [nx + 5.0, ny + 7.0], [nx, ny + 3.0], [nx - 5.0, ny + 7.0]], true, false);
             pg.text_center(nx, ny + 16.0, 7.0 * k, "N", true);
@@ -516,7 +703,7 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
         ];
         if let Some(datum) = p.proc.depth_datum_m {
             rows.push(("Depth datum", format!("{datum:.3} m elevation")));
-            rows.push(("Picks", "Acquisition-time picks hidden on migrated grid".into()));
+            rows.push(("Picks", "Acquisition-time picks projected onto depth grid".into()));
         }
         for (k2, v2) in rows {
             pg.fill_color([90, 90, 90]);
@@ -541,7 +728,11 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
                     break;
                 }
                 pg.fill_color([0, 0, 0]);
-                pg.text(ix, iy, ifs, &format!("{}. {} - {}", n + 1, e.step.name(), e.step.summary()), false);
+                let summary = match &e.step {
+                    Step::TopographicKirchhoff { velocity, .. } => format!("v={velocity:.3} m/ns"),
+                    _ => e.step.summary(),
+                };
+                pg.text(ix, iy, ifs, &format!("{}. {} - {}", n + 1, e.step.name(), summary), false);
                 iy += lh;
             }
             // Picks in this section
@@ -585,15 +776,19 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
         }
         let _ = iw;
         // Legend under the map title line
-        pg.stroke_color(ORANGE);
-        pg.line_width(5.0);
-        pg.line([mx, my - 14.0 * k], [mx + 18.0, my - 14.0 * k]);
-        pg.fill_color([0, 0, 0]);
-        pg.text(mx + 22.0, my - 11.5 * k, 7.0 * k, "section shown above", false);
-        pg.stroke_color(BLUE);
-        pg.line_width(1.6);
-        pg.line([mx + 110.0 * k, my - 14.0 * k], [mx + 128.0 * k, my - 14.0 * k]);
-        pg.text(mx + 132.0 * k, my - 11.5 * k, 7.0 * k, "profile track", false);
+        if p.coords.is_empty() {
+            pg.text(mx, my - 11.5 * k, 7.0 * k, "This profile has no GPS track", false);
+        } else {
+            pg.stroke_color(ORANGE);
+            pg.line_width(5.0);
+            pg.line([mx, my - 14.0 * k], [mx + 18.0, my - 14.0 * k]);
+            pg.fill_color([0, 0, 0]);
+            pg.text(mx + 22.0, my - 11.5 * k, 7.0 * k, "section shown above", false);
+            pg.stroke_color(BLUE);
+            pg.line_width(1.6);
+            pg.line([mx + 110.0 * k, my - 14.0 * k], [mx + 128.0 * k, my - 14.0 * k]);
+            pg.text(mx + 132.0 * k, my - 11.5 * k, 7.0 * k, "profile track", false);
+        }
         pdf.add_page(pg);
     }
     pdf.write(path).map_err(|e| e.to_string())?;

@@ -47,6 +47,74 @@ mod orientation_tests {
     }
 }
 
+#[cfg(test)]
+mod undo_tests {
+    use super::*;
+
+    fn app() -> App {
+        let mut app = App::headless(vec![], None);
+        app.add_profile(crate::demo::make().remove(0));
+        app
+    }
+
+    #[test]
+    fn undo_restores_deleted_point_then_undoes_its_placement() {
+        let mut app = app();
+        app.apply_action(0, Action::Point(5.0, 3.0, 1.0));
+        let id = app.markers[0].id;
+        app.delete_with_undo(&[id], false);
+        assert!(app.markers.is_empty());
+        app.undo_pick();
+        assert_eq!(app.markers.len(), 1);
+        app.undo_pick();
+        assert!(app.markers.is_empty());
+        assert_eq!(app.next_pick_id, id);
+    }
+
+    #[test]
+    fn undo_walks_back_through_layer_coordinates() {
+        let mut app = app();
+        app.auto_track = false;
+        app.apply_action(0, Action::LayerPoint(4, 10.0, false));
+        app.apply_action(0, Action::LayerPoint(8, 12.0, false));
+        app.finish_line();
+        assert_eq!(app.lines.len(), 1);
+        app.undo_pick();
+        assert_eq!(app.open_line.as_ref().unwrap().points.len(), 2);
+        app.undo_pick();
+        assert_eq!(app.open_line.as_ref().unwrap().points.len(), 1);
+        app.undo_pick();
+        assert!(app.open_line.is_none());
+        assert!(app.lines.is_empty());
+    }
+
+    #[test]
+    fn undo_saved_hyperbola_restores_fit() {
+        let mut app = app();
+        app.apply_action(0, Action::Apex(5.0, 10.0));
+        app.save_hyperbola();
+        assert_eq!(app.markers.len(), 1);
+        app.undo_pick();
+        assert!(app.markers.is_empty());
+        assert!(app.hyperbola.is_some());
+        app.undo_pick();
+        assert!(app.hyperbola.is_none());
+    }
+
+    #[test]
+    fn one_undo_restores_box_deleted_picks_and_fit() {
+        let mut app = app();
+        app.apply_action(0, Action::Point(5.0, 3.0, 1.0));
+        let id = app.markers[0].id;
+        app.apply_action(0, Action::Apex(6.0, 10.0));
+        app.delete_with_undo(&[id], true);
+        assert!(app.markers.is_empty() && app.hyperbola.is_none());
+        app.undo_pick();
+        assert_eq!(app.markers.len(), 1);
+        assert!(app.hyperbola.is_some());
+    }
+}
+
 impl App {
     fn snap_at(&self, p: &Profile, tr: usize, s: f32) -> f32 {
         if tr >= p.proc.ntr {
@@ -67,6 +135,7 @@ impl App {
             });
             return;
         };
+        if !ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary)) { self.velocity_drag_active = false; }
         let pid = self.profiles[a].id;
         let reversed = self.profiles[a].reverse_display;
         // Topography: per-trace shift (display samples) and the shifted section to draw.
@@ -581,22 +650,21 @@ impl App {
                 ids.extend(self.lines.iter().filter(|l| in_box_l(l) && l.type_idx == ct).map(|l| l.id));
                 let others = self.markers.iter().filter(|m| in_box_m(m) && m.type_idx != ct).count() + self.lines.iter().filter(|l| in_box_l(l) && l.type_idx != ct).count();
                 let tname = self.marker_types.get(ct).map(|t| t.name.clone()).unwrap_or_default();
-                if self.hyperbola.as_ref().map(|hf| r.contains(line_pt(hf.trace, hf.time_ns))).unwrap_or(false) {
-                    self.hyperbola = None;
-                }
+                let clear_fit = self.hyperbola.as_ref().map(|hf| r.contains(line_pt(hf.trace, hf.time_ns))).unwrap_or(false);
                 self.select_rect = None;
                 action = Some(if ids.is_empty() {
-                    Action::Status(if others > 0 { format!("No \"{tname}\" picks inside the box ({others} of other types kept).") } else { "No picks inside the box.".into() })
+                    if clear_fit { Action::CancelFit } else { Action::Status(if others > 0 { format!("No \"{tname}\" picks inside the box ({others} of other types kept).") } else { "No picks inside the box.".into() }) }
                 } else {
                     if others > 0 {
                         self.status = format!("{others} pick(s) of other types kept.");
                     }
-                    Action::DeleteMany(ids)
+                    Action::DeleteMany(ids, clear_fit)
                 });
             }
         }
-        if let Some(hf) = &mut self.hyperbola {
-            if self.mode == PickMode::Hyperbola && hover_pos.is_some() && mods.alt && scroll.y != 0.0 {
+        if self.hyperbola.is_some() && self.mode == PickMode::Hyperbola && hover_pos.is_some() && mods.alt && scroll.y != 0.0 {
+            self.record_pick_undo();
+            if let Some(hf) = &mut self.hyperbola {
                 hf.velocity = (hf.velocity * (scroll.y * 0.001).exp()).clamp(0.01, 0.3);
             }
         }
@@ -609,10 +677,12 @@ impl App {
             }
         }
         if esc {
+            if self.hyperbola.is_some() || self.open_line.is_some() { self.record_pick_undo(); }
             self.hyperbola = None;
             self.open_line = None;
         }
         if backspace && self.open_line.is_some() && !ui.ctx().wants_keyboard_input() {
+            if self.open_line.as_ref().is_some_and(|l| !l.points.is_empty()) { self.record_pick_undo(); }
             if let Some(l) = &mut self.open_line {
                 l.points.pop();
             }
@@ -642,13 +712,15 @@ impl App {
         ap.text(arect.left_top() + egui::vec2(3.0, 2.0), Align2::LEFT_TOP, format!("trace {}", tr_show + 1), FontId::proportional(10.5), Color32::DARK_GRAY);
     }
 
-    pub fn delete_with_undo(&mut self, ids: &[u32]) {
+    pub fn delete_with_undo(&mut self, ids: &[u32], clear_fit: bool) {
         let n = self.markers.iter().filter(|m| ids.contains(&m.id)).count() + self.lines.iter().filter(|l| ids.contains(&l.id)).count();
-        if n == 0 {
+        if n == 0 && !clear_fit {
             return;
         }
+        self.record_pick_undo();
         self.markers.retain(|m| !ids.contains(&m.id));
         self.lines.retain(|l| !ids.contains(&l.id));
+        if clear_fit { self.hyperbola = None; }
         if self.selected_pick.map(|s| ids.contains(&s)).unwrap_or(false) {
             self.selected_pick = None;
         }
@@ -662,20 +734,23 @@ impl App {
             Action::Select(id) => self.selected_pick = id,
             Action::Delete(id) => {
                 self.status.clear();
-                self.delete_with_undo(&[id]);
+                self.delete_with_undo(&[id], false);
             }
-            Action::DeleteMany(ids) => {
-                self.delete_with_undo(&ids);
+            Action::DeleteMany(ids, clear_fit) => {
+                self.delete_with_undo(&ids, clear_fit);
             }
             Action::CancelFit => {
+                self.record_pick_undo();
                 self.hyperbola = None;
                 self.status = "Hyperbola removed.".into();
             }
             Action::CancelLine => {
+                self.record_pick_undo();
                 self.open_line = None;
                 self.status = "Layer line in progress removed.".into();
             }
             Action::Point(tr, t, amp) => {
+                self.record_pick_undo();
                 let ti = if self.marker_types.get(self.cur_type).map(|t| t.kind == MarkerKind::Point).unwrap_or(false) { self.cur_type } else { 0 };
                 self.markers.push(Marker { id: self.next_pick_id, profile_id: pid, type_idx: ti, trace: tr, time_ns: t, amplitude: amp, velocity: None, comment: String::new() });
                 self.selected_pick = Some(self.next_pick_id);
@@ -684,15 +759,23 @@ impl App {
                 self.next_pick_id += 1;
             }
             Action::Apex(tr, t) => {
+                self.record_pick_undo();
                 let v = self.hyperbola.as_ref().map(|h| h.velocity).unwrap_or(self.profiles[a].velocity);
                 self.hyperbola = Some(HyperbolaFit { trace: tr, time_ns: t, velocity: v });
             }
             Action::Velocity(v) => {
+                if !self.velocity_drag_active {
+                    self.record_pick_undo();
+                    self.velocity_drag_active = true;
+                }
                 if let Some(h) = &mut self.hyperbola {
                     h.velocity = v;
                 }
             }
             Action::LayerPoint(tr, s, finish) => {
+                if !finish && self.open_line.as_ref().filter(|l| l.profile_id == pid)
+                    .and_then(|l| l.points.last()).is_some_and(|q| q.0.round() as usize == tr) { return; }
+                self.record_pick_undo();
                 let p = &self.profiles[a];
                 let to_t = |tr: usize, s: f32| p.pick_time_of_y(tr as f32, p.proc.y_of(s));
                 let ti = if self.marker_types.get(self.cur_type).map(|t| t.kind == MarkerKind::Line).unwrap_or(false) {
@@ -740,7 +823,7 @@ impl App {
                 line.points.extend(new_pts);
                 self.open_line = Some(line);
                 if finish {
-                    self.finish_line();
+                    self.finish_line_without_undo();
                 }
             }
             Action::FinishLine => self.finish_line(),
@@ -752,7 +835,7 @@ impl App {
 enum Action {
     Select(Option<u32>),
     Delete(u32),
-    DeleteMany(Vec<u32>),
+    DeleteMany(Vec<u32>, bool),
     CancelFit,
     CancelLine,
     Point(f32, f32, f32),

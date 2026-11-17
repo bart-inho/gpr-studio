@@ -127,6 +127,22 @@ impl Page {
         b.extend_from_slice(b") Tj ET\n");
         self.content.extend(b);
     }
+    pub fn text_halo(&mut self, x: f32, y: f32, size: f32, s: &str, bold: bool, color: [u8; 3]) {
+        self.save();
+        self.stroke_color([255, 255, 255]);
+        self.line_width(2.0);
+        let font = if bold { "F2" } else { "F1" };
+        let mut b = format!("BT /{font} {size:.1} Tf 1 Tr {:.2} {:.2} Td (", x, self.y(y)).into_bytes();
+        b.extend(latin1(s));
+        b.extend_from_slice(b") Tj ET\n");
+        self.content.extend(b);
+        self.fill_color(color);
+        let mut b = format!("BT /{font} {size:.1} Tf 0 Tr {:.2} {:.2} Td (", x, self.y(y)).into_bytes();
+        b.extend(latin1(s));
+        b.extend_from_slice(b") Tj ET\n");
+        self.content.extend(b);
+        self.restore();
+    }
     pub fn text_right(&mut self, x: f32, y: f32, size: f32, s: &str, bold: bool) {
         let w = text_width(s, size);
         self.text(x - w, y, size, s, bold);

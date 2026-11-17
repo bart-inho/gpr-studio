@@ -223,6 +223,7 @@ pub fn load_profiles(mut file: ProjFile, path: PathBuf, prog: &std::sync::Arc<Pr
 /// Replace the app's contents with a loaded project.
 pub fn apply(app: &mut App, l: Loaded) -> String {
     let f = l.file;
+    app.clear_pick_history();
     app.profiles.clear();
     app.views.clear();
     app.markers.clear();
@@ -626,6 +627,19 @@ mod topographic_project_tests {
         assert!(reopened.profiles[0].proc.data.iter().zip(&app.profiles[0].proc.data).all(|(a,b)| a.is_nan() == b.is_nan()));
         let pdf = PathBuf::from("target/topographic-report-test.pdf");
         assert!(crate::report::export(&reopened, &pdf).is_ok());
+        let bytes = std::fs::read(&pdf).unwrap();
+        let page_stream = bytes.windows(7).enumerate().filter_map(|(i, b)| (b == b"stream\n").then_some(i + 7))
+            .find_map(|start| {
+                let mut decoded = Vec::new();
+                std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(&bytes[start..]), &mut decoded).ok()?;
+                decoded.windows(5).any(|b| b == b"BT /F").then_some(decoded)
+            });
+        let content = page_stream.expect("PDF page content");
+        assert!(content.windows(4).any(|b| b == b"(#1)"),
+            "pick ID should appear on the migrated radargram");
+        assert!(content.windows(b"Topographic Kirchhoff - v=0.100 m/ns".len())
+            .any(|b| b == b"Topographic Kirchhoff - v=0.100 m/ns"));
+        assert!(!content.windows(b"GPS above antenna".len()).any(|b| b == b"GPS above antenna"));
     }
 }
 

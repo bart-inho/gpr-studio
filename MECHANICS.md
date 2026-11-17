@@ -57,7 +57,7 @@ Marker types (name, colour, symbol, point/line) are editable. Originals' pick ca
 
 Controls in the picking modes: right-click a pick (marker, fitted hyperbola, layer line, or the hyperbola / line in progress)
 deletes it; Shift + right-drag deletes every pick inside the box. Deleting only ever touches picks of the marker type selected
-in the toolbar (other types are kept and the status line says so). No undo.
+in the toolbar (other types are kept and the status line says so). Ctrl+Z undoes the last 100 picking actions, including point and layer placement, hyperbola fitting, and deletion; repeated undo walks back through layer coordinates.
 A layer line ends with a double-click (or Enter); the next click starts a new line. With Snap = None the
 phase follow draws straight between clicks (no snapping at all).
 
@@ -87,7 +87,7 @@ the left axis is time below the highest point, the right axis elevation = z_max 
 ## Exports
 GeoPackage 1.2 (application_id 0x47504B47, user_version 10200): `profiles` (LineStringZ), `trace_points`, `markers` (PointZ),
 `layer_picks` (LineStringZ, elevation = surface − depth) and `layer_pick_vertices`; SRS = project CRS (WKT from the EPSG table).
-PDF: A4/A3 landscape; per page radargram section + GPS map with the same section highlighted + tables.
+PDF: A4/A3 landscape; per page radargram section + GPS map framed to the whole survey, with the current profile and section highlighted + tables. The optional 1×1 metre scale is on by default: it keeps the chosen metres per page, uses equal horizontal and vertical metre scales when the depth fits, and compresses the vertical scale when needed to show the full depth. Whole-profile pages use the full vertical range; visible-section pages keep the current vertical view.
 
 ## Topographic Kirchhoff migration
 
@@ -99,4 +99,4 @@ Output trace `j` is at `x_j`, and its vertical coordinate is depth `d` below dat
 
 This approximation is best for near-zero antenna separation, a locally straight profile, moderate slopes, and reflectors near the 2D profile plane. Finite antenna separation changes travel time, sharply curved tracks violate the 2D chainage geometry, and off-plane reflectors or steep terrain can misfocus. Velocity must be representative and constant. The measured GPS positions must cover every trace by interpolation between fixes no farther apart than the chosen horizontal gap limit. Missing, implicit, invalid, duplicated, or unsupported height/position gaps reject the topographic step. The operation never uses the image created by Show topography, and that display shift is not applied to migrated output.
 
-Old picks are `(trace, acquisition time)` and remain so. They are hidden and cannot be edited on the migrated depth grid; PDF radargrams also omit them. Pick CSV and GeoPackage exports retain acquisition time and depth below local GPS surface, based on the profile's pick velocity. The migrated SEG-Y writes datum depth, GPS horizontal chainage, antenna elevations corrected by `H`, and NaN above ground. Reimporting that SEG-Y with the current reader replaces nonfinite samples with zero; reopen the project to preserve the no-data mask.
+Old picks are `(trace, acquisition time)` and remain so. They are hidden and cannot be edited on the migrated depth grid in the app; PDF radargrams project them onto that grid. Pick CSV and GeoPackage exports retain acquisition time and depth below local GPS surface, based on the profile's pick velocity. The migrated SEG-Y writes datum depth, GPS horizontal chainage, antenna elevations corrected by `H`, and NaN above ground. Reimporting that SEG-Y with the current reader replaces nonfinite samples with zero; reopen the project to preserve the no-data mask.

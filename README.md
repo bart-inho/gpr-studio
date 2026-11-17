@@ -27,9 +27,9 @@ picking, mapping and reporting. Written in Rust with egui; runs on Windows, macO
   display direction is saved in the project. **1x1 ratio** always shows the whole height of the section and
   only changes the horizontal span (around the current centre) so that one metre is as long horizontally
   as vertically; time sections use the toolbar velocity. A profile too short to fill the width is drawn narrower.
-- **Picking** – typed point markers, hyperbola velocity fitting, layer lines with phase following and snapping.
+- **Picking** – typed point markers, hyperbola velocity fitting, layer lines with phase following and snapping; Ctrl+Z undoes picking steps and deletions.
 - **Export** – GeoPackage (profiles, markers, layer picks, trace points), SEG-Y of chosen processing steps,
-  PDF report (radargram + map with the same section highlighted), CSV of picks.
+  PDF report (radargram with optional exact 1×1 metre scale and a minimum section width, plus a whole-survey map capped at a quarter page height with the same section highlighted), CSV of picks.
 - **Projects** – `.gprproj` files keep the file list, processing, GPS, picks, CRS and basemaps.
   Ctrl+S saves to the project's file, File › Open last project reopens the previous one, and closing only
   asks to save when something changed. Files inside the project's folder are stored with relative paths;
@@ -47,7 +47,7 @@ picking, mapping and reporting. Written in Rust with egui; runs on Windows, macO
 
 Associate GPS with measured elevations, choose a projected CRS in metres, then add **Topo Kirchhoff** to the processing sequence. Set the constant velocity, summation width, maximum measured GPS gap, and the vertical offset from antenna to GPS receiver (positive when the GPS is above the antenna). A zero offset means the GPS height is already the antenna height. This operation uses the unshifted time data at that point in the sequence. Keep it as the last step; further time-based processing is not applicable to its depth output. The ordinary Kirchhoff and FK steps retain their flat-surface assumptions.
 
-The output vertical axis is **depth below the highest antenna elevation**; the right axis shows elevation. The horizontal axis uses horizontal GPS distance even if the ordinary profile display uses a nominal trace spacing. Blank space above the local surface is stored as no data. **Show topography** is display-only and is ignored for this migrated result. Existing picks remain in acquisition time and are hidden on the migrated radargram and PDF; disable the migration step to view or edit them. Pick CSV/GeoPackage exports retain the original time and local-depth meaning. SEG-Y includes the datum in its text header, corrected antenna elevations in trace headers, and IEEE NaN above the local surface.
+The output vertical axis is **depth below the highest antenna elevation**; the right axis shows elevation. The horizontal axis uses horizontal GPS distance even if the ordinary profile display uses a nominal trace spacing. Blank space above the local surface is stored as no data. **Show topography** is display-only and is ignored for this migrated result. Existing picks remain in acquisition time. The PDF projects them onto the migrated depth grid; disable the migration step to view or edit them in the app. Pick CSV/GeoPackage exports retain the original time and local-depth meaning. SEG-Y includes the datum in its text header, corrected antenna elevations in trace headers, and IEEE NaN above the local surface.
 
 Full first-to-last trace coverage and finite, increasing positions are required. GPS gaps larger than the stated limit cause an error. Older project GPS entries without verified height provenance need to be re-associated with the original GPS file. See [MECHANICS.md](MECHANICS.md) for the equation, assumptions, and references.
 

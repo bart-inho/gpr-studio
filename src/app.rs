@@ -53,6 +53,16 @@ pub struct HyperbolaFit {
     pub velocity: f32,
 }
 
+#[derive(Clone)]
+struct PickSnapshot {
+    markers: Vec<Marker>,
+    lines: Vec<LinePick>,
+    open_line: Option<LinePick>,
+    hyperbola: Option<HyperbolaFit>,
+    selected_pick: Option<u32>,
+    next_pick_id: u32,
+}
+
 pub struct GpsRow {
     pub profile_id: u32,
     pub name: String,
@@ -116,6 +126,7 @@ pub struct PdfOptions {
     pub a3: bool,
     pub range: PdfRange,
     pub chunk_m: f32,
+    pub one_to_one: bool,
     pub all_profiles: bool,
     pub basemap: bool,
     pub markers: bool,
@@ -163,8 +174,10 @@ pub struct App {
     pub markers: Vec<Marker>,
     pub lines: Vec<LinePick>,
     pub next_pick_id: u32,
+    pick_undo: VecDeque<PickSnapshot>,
     pub open_line: Option<LinePick>,
     pub hyperbola: Option<HyperbolaFit>,
+    pub(crate) velocity_drag_active: bool,
     pub selected_pick: Option<u32>,
     pub hover: Option<(f32, f32)>,
     pub map: MapState,
@@ -308,8 +321,10 @@ impl App {
             markers: Vec::new(),
             lines: Vec::new(),
             next_pick_id: 1,
+            pick_undo: VecDeque::new(),
             open_line: None,
             hyperbola: None,
+            velocity_drag_active: false,
             selected_pick: None,
             hover: None,
             map: MapState { center: [0.0, 0.0], scale: 1.0, fitted: false, hover_world: None, hover_trace: None },
@@ -327,7 +342,7 @@ impl App {
             show_about: false,
             show_header: false,
             gpkg_opts: crate::gpkg::ExportOptions { profiles: true, markers: true, layers: true, trace_points: false, trace_step: 10 },
-            pdf_opts: PdfOptions { a3: false, range: PdfRange::Visible, chunk_m: 20.0, all_profiles: false, basemap: true, markers: true, processing: true, title: String::new() },
+            pdf_opts: PdfOptions { a3: false, range: PdfRange::Visible, chunk_m: 20.0, one_to_one: true, all_profiles: false, basemap: true, markers: true, processing: true, title: String::new() },
             status: "Open GPR files with File > Open, or load the demo survey.".into(),
             screenshot,
             frame: 0,
@@ -404,6 +419,7 @@ impl App {
     }
 
     pub fn load_demo(&mut self, with_processing: bool) {
+        self.clear_pick_history();
         let first_id = self.next_id;
         for p in crate::demo::make() {
             let id = self.add_profile(p);
@@ -537,7 +553,42 @@ impl App {
         }
     }
 
+    pub(crate) fn record_pick_undo(&mut self) {
+        // shortcut: keep 100 picking steps in memory; use action deltas if large surveys make snapshots costly.
+        if self.pick_undo.len() == 100 { self.pick_undo.pop_front(); }
+        self.pick_undo.push_back(PickSnapshot {
+            markers: self.markers.clone(), lines: self.lines.clone(),
+            open_line: self.open_line.clone(), hyperbola: self.hyperbola.clone(),
+            selected_pick: self.selected_pick, next_pick_id: self.next_pick_id,
+        });
+    }
+
+    pub(crate) fn undo_pick(&mut self) {
+        let Some(previous) = self.pick_undo.pop_back() else {
+            self.status = "No picking step to undo.".into();
+            return;
+        };
+        self.markers = previous.markers;
+        self.lines = previous.lines;
+        self.open_line = previous.open_line;
+        self.hyperbola = previous.hyperbola;
+        self.selected_pick = previous.selected_pick;
+        self.next_pick_id = previous.next_pick_id;
+        self.velocity_drag_active = false;
+        self.status = "Picking step undone.".into();
+    }
+
+    pub(crate) fn clear_pick_history(&mut self) {
+        self.pick_undo.clear();
+        self.open_line = None;
+        self.hyperbola = None;
+        self.velocity_drag_active = false;
+        self.selected_pick = None;
+    }
+
     pub fn delete_pick(&mut self, id: u32) {
+        if !self.markers.iter().any(|m| m.id == id) && !self.lines.iter().any(|l| l.id == id) { return; }
+        self.record_pick_undo();
         self.markers.retain(|m| m.id != id);
         self.lines.retain(|l| l.id != id);
         if self.selected_pick == Some(id) {
@@ -546,6 +597,11 @@ impl App {
     }
 
     pub fn finish_line(&mut self) {
+        if self.open_line.is_some() { self.record_pick_undo(); }
+        self.finish_line_without_undo();
+    }
+
+    pub(crate) fn finish_line_without_undo(&mut self) {
         if let Some(l) = self.open_line.take() {
             if l.points.len() >= 2 {
                 self.status = format!("Layer pick #{} saved ({} points).", l.id, l.points.len());
@@ -1313,11 +1369,19 @@ impl App {
             ui.label("Section of the profile on each page:");
             ui.radio_value(&mut self.pdf_opts.range, PdfRange::Visible, "the part visible in the data view");
             ui.radio_value(&mut self.pdf_opts.range, PdfRange::Whole, "the whole profile on one page");
+            let min_width = crate::report::minimum_section_width(self);
             ui.horizontal(|ui| {
                 ui.radio_value(&mut self.pdf_opts.range, PdfRange::Chunks, "the whole profile, one page every");
-                ui.add(egui::DragValue::new(&mut self.pdf_opts.chunk_m).range(1.0..=10000.0).suffix(" m"));
+                ui.add(egui::DragValue::new(&mut self.pdf_opts.chunk_m).range(min_width..=10000.0f32.max(min_width)).suffix(" m"));
             });
+            ui.checkbox(&mut self.pdf_opts.one_to_one, "1×1 metres on the radargram")
+                .on_hover_text("Keep the full depth at exact 1×1. The minimum section width grows when the depth needs more space; shorter profiles leave part of the frame blank.");
             ui.checkbox(&mut self.pdf_opts.all_profiles, "All profiles (otherwise only the active one)");
+            if self.pdf_opts.one_to_one {
+                let min_width = crate::report::minimum_section_width(self);
+                self.pdf_opts.chunk_m = self.pdf_opts.chunk_m.max(min_width);
+                if self.pdf_opts.range == PdfRange::Chunks { ui.weak(format!("Minimum section width for 1×1: {min_width:.1} m")); }
+            }
             ui.checkbox(&mut self.pdf_opts.basemap, "Basemap under the GPS tracks");
             ui.checkbox(&mut self.pdf_opts.markers, "Markers and layer picks (data view and map)");
             ui.checkbox(&mut self.pdf_opts.processing, "Processing sequence and pick table");
@@ -1557,9 +1621,9 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 for (m, icon, tip) in [
                     (PickMode::Navigate, "✋ Navigate", "Drag to pan; wheel: scroll vertically; side wheel: slide along the profile; Shift + wheel: time axis from 0 down to the depth you want; Ctrl + wheel: zoom horizontally (zooming out past the profile makes the plot narrower, never stretched); double-click to fit; Ctrl+S saves the project"),
-                    (PickMode::Point, "+ Point", "Click to place a point marker.\nRight-click a pick to delete it; Shift + right-drag deletes all picks in a box.\nOnly picks of the type selected in the toolbar are deleted."),
-                    (PickMode::Hyperbola, "^ Hyperbola", "Click the apex, drag a flank to fit the velocity, Enter saves.\nRight-click a hyperbola to delete it."),
-                    (PickMode::Layer, "~ Layer", "Click along a reflector; double-click (or Enter) ends the line and the next click starts a new one.\nBackspace removes the last point; right-click deletes a pick; Shift + right-drag deletes picks in a box."),
+                    (PickMode::Point, "+ Point", "Click to place a point marker.\nRight-click a pick to delete it; Shift + right-drag deletes all picks in a box.\nCtrl+Z undoes the last picking step. Only picks of the type selected in the toolbar are deleted."),
+                    (PickMode::Hyperbola, "^ Hyperbola", "Click the apex, drag a flank to fit the velocity, Enter saves.\nRight-click a hyperbola to delete it; Ctrl+Z undoes the last picking step."),
+                    (PickMode::Layer, "~ Layer", "Click along a reflector; double-click (or Enter) ends the line and the next click starts a new one.\nBackspace removes the last point; right-click deletes a pick; Shift + right-drag deletes picks in a box. Ctrl+Z undoes the last picking step."),
                     (PickMode::Delete, "✖ Delete", "Click a pick to delete it; Shift + right-drag deletes all picks in a box.\nOnly picks of the type selected in the toolbar are deleted."),
                 ] {
                     if ui.selectable_label(self.mode == m, icon).on_hover_text(tip).clicked() {
@@ -1845,6 +1909,7 @@ impl App {
                     self.save_hyperbola();
                 }
                 if cancel {
+                    self.record_pick_undo();
                     self.hyperbola = None;
                 }
             }
@@ -1852,6 +1917,7 @@ impl App {
     }
 
     pub fn save_hyperbola(&mut self) {
+        if self.active.is_some() && self.hyperbola.is_some() { self.record_pick_undo(); }
         let (Some(a), Some(h)) = (self.active, self.hyperbola.take()) else { return };
         let p = &self.profiles[a];
         let idx = if self.marker_types.get(self.cur_type).map(|t| t.kind == MarkerKind::Point).unwrap_or(false) { self.cur_type } else { 0 };
@@ -2079,6 +2145,9 @@ impl eframe::App for App {
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) && !self.profiles.is_empty() {
             self.save_project(false);
+        }
+        if !ctx.wants_keyboard_input() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
+            self.undo_pick();
         }
         self.poll_jobs(ctx);
         self.pump_tasks(ctx);
