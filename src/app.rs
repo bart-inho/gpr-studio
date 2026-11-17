@@ -3,7 +3,7 @@
 use crate::basemap::{self, Basemap};
 use crate::crs::{self, CrsSpec};
 use crate::formats::{self, ImportOptions, SegyTimeUnit};
-use crate::gps::{self, GpsFormat};
+use crate::gps::GpsFormat;
 use crate::model::*;
 use crate::processing::{self, BgMode, Ctx, Divergence, Snap, Step, StepEntry, Taper, TimeZeroMode};
 use crate::render::ColorMap;

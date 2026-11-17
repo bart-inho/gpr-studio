@@ -222,7 +222,7 @@ impl App {
             let ct = fr.trace_of_x(hp.x) + 0.5;
             let cs = fr.sample_of_y(hp.y) + 0.5;
             let mut fx = 1.0f32;
-            let mut fy = 1.0f32;
+            let fy = 1.0f32;
             // Shift + wheel crops the time axis; Ctrl + wheel zooms horizontally.
             // Otherwise the main wheel scrolls vertically and the side wheel horizontally.
             let ctrl = mods.ctrl || mods.command;
@@ -695,21 +695,23 @@ impl App {
         let p = &self.profiles[a];
         let arect = Rect::from_min_max(Pos2::new(avail.right() - ascan_w, plot.top()), Pos2::new(avail.right(), plot.bottom()));
         let ap = ui.painter_at(arect.expand(2.0));
-        ap.rect_filled(arect, 0.0, Color32::from_gray(248));
+        let dark = ui.visuals().dark_mode;
+        let (a_bg, a_fg) = if dark { (ui.visuals().panel_fill, Color32::WHITE) } else { (Color32::WHITE, Color32::BLACK) };
+        ap.rect_filled(arect, 0.0, a_bg);
         ap.rect_stroke(arect, 0.0, Stroke::new(1.0_f32, Color32::from_gray(160)), egui::StrokeKind::Inside);
         let tr_show = self.hover.map(|h| h.0.round() as usize).unwrap_or(((view.tr0 + view.tr1) / 2.0) as usize).min(p.proc.ntr.saturating_sub(1));
         ap.line_segment([Pos2::new(arect.center().x, arect.top()), Pos2::new(arect.center().x, arect.bottom())], Stroke::new(0.5_f32, Color32::GRAY));
         if p.proc.ntr > 0 {
             let col = p.proc.trace(tr_show);
-            let sa = view.s0.max(0.0) as usize;
-            let sb = (view.s1.ceil() as usize).min(p.proc.ns);
+            let _sa = view.s0.max(0.0) as usize;
+            let _sb = (view.s1.ceil() as usize).min(p.proc.ns);
             let off = shift(tr_show as f32);
             let sa = (view.s0 - off).max(0.0) as usize;
             let sb = ((view.s1 - off).ceil().max(0.0) as usize).min(p.proc.ns);
             let pts: Vec<Pos2> = (sa..sb).map(|s| Pos2::new(arect.center().x + (col[s] / (clip * 1.5)).clamp(-1.0, 1.0) * ascan_w * 0.48, fr.y_of_sample(s as f32 + off))).collect();
-            ap.add(egui::Shape::line(pts, Stroke::new(1.0_f32, Color32::BLACK)));
+            ap.add(egui::Shape::line(pts, Stroke::new(1.0_f32, a_fg)));
         }
-        ap.text(arect.left_top() + egui::vec2(3.0, 2.0), Align2::LEFT_TOP, format!("trace {}", tr_show + 1), FontId::proportional(10.5), Color32::DARK_GRAY);
+        ap.text(arect.left_top() + egui::vec2(3.0, 2.0), Align2::LEFT_TOP, format!("trace {}", tr_show + 1), FontId::proportional(10.5), if dark { Color32::LIGHT_GRAY } else { Color32::DARK_GRAY });
     }
 
     pub fn delete_with_undo(&mut self, ids: &[u32], clear_fit: bool) {

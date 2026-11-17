@@ -128,7 +128,7 @@ pub fn export(path: &Path, crs: &CrsSpec, opt: &ExportOptions, profiles: &[Profi
         tx.execute("INSERT INTO gpkg_geometry_columns VALUES (?1, 'geom', ?2, ?3, 1, 0)", params![table, gtype, srs])?;
         Ok(())
     };
-    let mut extent = |pts: &[[f64; 3]], ext: &mut [f64; 4]| {
+    let extent = |pts: &[[f64; 3]], ext: &mut [f64; 4]| {
         for p in pts {
             ext[0] = ext[0].min(p[0]);
             ext[1] = ext[1].min(p[1]);
