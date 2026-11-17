@@ -15,7 +15,7 @@ picking, mapping and reporting. Written in Rust with egui; runs on Windows, macO
   window (buttons in the map header, or the Map menu); the choice is kept for the next start.
 - **Processing** – set time zero, dewow, DC shift, background removal, bandpass (FFT and Butterworth),
   AGC (optionally with the gain smoothed over neighbouring traces), energy decay, gain function,
-  divergence compensation, trace normalisation, running (moving) average over traces, average xy-filter,
+  divergence compensation, trace normalisation (90th percentile of absolute amplitude per trace), running (moving) average over traces, average xy-filter,
   diffraction stack, flat and topographic Kirchhoff migration, FK (Stolt) migration, time-depth conversion. Runs in the background
   with a progress bar; sequences can be applied to all profiles.
 - **Data view** – distance in metres from the file's trace spacing (or GPS); "Show topography" lets time

@@ -78,6 +78,32 @@ pub struct StepEditor {
     pub spectrum: Vec<(f32, f32)>,
 }
 
+fn add_step(steps: &mut Vec<StepEntry>, step: Step) {
+    let after_dewow = if matches!(&step, Step::TraceNormalize) {
+        steps.iter().rposition(|e| matches!(&e.step, Step::Dewow { .. }))
+    } else {
+        None
+    };
+    let entry = StepEntry { enabled: true, step };
+    if let Some(i) = after_dewow { steps.insert(i + 1, entry); } else { steps.push(entry); }
+}
+
+#[cfg(test)]
+mod trace_normalisation_order_tests {
+    use super::*;
+
+    #[test]
+    fn new_normalisation_follows_dewow() {
+        let mut steps = vec![
+            StepEntry { enabled: true, step: Step::Dewow { window_ns: 5.0 } },
+            StepEntry { enabled: true, step: Step::BackgroundRemoval { mode: BgMode::WholeProfile, t_start: 0.0, t_end: 10.0 } },
+        ];
+        add_step(&mut steps, Step::TraceNormalize);
+        assert!(matches!(steps[1].step, Step::TraceNormalize));
+        assert!(matches!(steps[2].step, Step::BackgroundRemoval { .. }));
+    }
+}
+
 pub struct MapState {
     pub center: [f64; 2],
     pub scale: f64,
@@ -386,6 +412,7 @@ impl App {
                 self.profiles[i].steps = vec![
                     StepEntry { enabled: true, step: Step::TimeZero { mode: TimeZeroMode::FirstBreak, shift_ns: 0.0, threshold_pct: 20.0 } },
                     StepEntry { enabled: true, step: Step::Dewow { window_ns: 3.0 } },
+                    StepEntry { enabled: true, step: Step::TraceNormalize },
                     StepEntry { enabled: true, step: Step::BackgroundRemoval { mode: BgMode::WholeProfile, t_start: 0.0, t_end: 1e9 } },
                     StepEntry { enabled: true, step: Step::GainFunction { linear: 1.0, exponent_db_m: 4.0, t_start: 0.0, max_gain: 100.0 } },
                 ];
@@ -703,7 +730,7 @@ impl App {
                         ui.end_row();
                     }
                     Step::TraceNormalize => {
-                        ui.label("Every trace is scaled to a maximum of 1.");
+                        ui.label("Each trace is divided by its 90th percentile absolute amplitude. Non-finite samples become zero; traces with a zero scale remain unchanged.");
                         ui.end_row();
                     }
                     Step::RunningAverage { traces, t_start, t_end } => {
@@ -801,11 +828,11 @@ impl App {
                     { let id = self.profiles[a].id; self.request_process(vec![id]); }
                 } else if apply_all {
                     for i in 0..self.profiles.len() {
-                        self.profiles[i].steps.push(StepEntry { enabled: true, step: ed.step.clone() });
+                        add_step(&mut self.profiles[i].steps, ed.step.clone());
                         { let id = self.profiles[i].id; self.request_process(vec![id]); }
                     }
                 } else {
-                    self.profiles[a].steps.push(StepEntry { enabled: true, step: ed.step.clone() });
+                    add_step(&mut self.profiles[a].steps, ed.step.clone());
                     { let id = self.profiles[a].id; self.request_process(vec![id]); }
                 }
             }
@@ -1390,7 +1417,7 @@ impl App {
                     }
                 });
                 ui.menu_button("Processing", |ui| {
-                    let groups: [(&str, &[usize]); 5] = [("Static", &[0]), ("1D filter", &[1, 2, 4, 5]), ("Gain", &[6, 7, 8, 9, 10]), ("2D filter", &[3, 11, 16]), ("Migration / depth", &[12, 13, 14, 15])];
+                    let groups: [(&str, &[usize]); 5] = [("Static", &[0]), ("1D filter", &[1, 10, 2, 4, 5]), ("Gain", &[6, 7, 8, 9]), ("2D filter", &[3, 11, 16]), ("Migration / depth", &[12, 13, 14, 15])];
                     let all = Step::defaults();
                     for (g, idx) in groups {
                         ui.label(RichText::new(g).weak());
@@ -1707,7 +1734,7 @@ impl App {
             ui.heading("Processing sequence");
             let all = Step::defaults();
             ui.horizontal_wrapped(|ui| {
-                for (i, short) in [(0, "Time 0"), (1, "Dewow"), (3, "Background"), (6, "AGC"), (8, "Gain f(t)"), (7, "Energy decay"), (4, "Bandpass"), (5, "Butterworth"), (11, "Moving avg."), (16, "Avg xy"), (13, "Kirchhoff"), (17, "Topo Kirchhoff"), (14, "FK Stolt"), (15, "Time-depth")] {
+                for (i, short) in [(0, "Time 0"), (1, "Dewow"), (10, "Trace norm."), (3, "Background"), (6, "AGC"), (8, "Gain f(t)"), (7, "Energy decay"), (4, "Bandpass"), (5, "Butterworth"), (11, "Moving avg."), (16, "Avg xy"), (13, "Kirchhoff"), (17, "Topo Kirchhoff"), (14, "FK Stolt"), (15, "Time-depth")] {
                     if ui.small_button(short).on_hover_text(all[i].name()).clicked() {
                         self.open_step(all[i].clone());
                     }

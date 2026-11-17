@@ -33,6 +33,7 @@ Original coordinate conversions: UTM, UTM-degree, RD (NL), Swiss CH1903 only; he
 ## Processing (manual §1.11)
 - **Move start time / set time zero** (§1.11.3.3): data before time zero removed, start time set to 0. Automatic first break: first sample whose |amplitude| ≥ threshold × max of the mean |trace|; threshold default 20 % (*estimated*).
 - **Subtract-mean (dewow)** (§1.11.1.10): running mean over the window subtracted from the centre sample; window ≈ one period (default 1000/f ns).
+- **Trace normalisation** (after dewow in the demo sequence): replace non-finite samples with zero, then divide each trace by the 1-based `round(0.9 × samples)`-th sorted absolute amplitude. A zero scale leaves the trace unchanged. This follows the legacy MATLAB `tracenormalize` function and is less sensitive to isolated peaks than maximum-amplitude scaling.
 - **Subtract DC shift** (§1.11.1.11): mean between time 1 and time 2 subtracted from the whole trace.
 - **Background removal** (§1.11.8.3): mean trace over the chosen traces (whole profile or running window) subtracted, only inside start–end time.
 - **Bandpass frequency** (§1.11.1.3): FFT; 4 corner frequencies; cosine or cosine² tapers between f1–f2 and f3–f4, zero outside.

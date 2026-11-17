@@ -216,7 +216,7 @@ impl Step {
                 Divergence::Spherical => "spherical (t)".into(),
                 Divergence::Cylindrical => "line source (sqrt t)".into(),
             },
-            Step::TraceNormalize => String::new(),
+            Step::TraceNormalize => "90th percentile |amplitude| per trace".into(),
             Step::RunningAverage { traces, t_start, t_end } => format!("{traces} traces, {}", trange(*t_start, *t_end)),
             Step::AverageXY { traces, samples, t_start, t_end } => format!("{traces} traces x {samples} samples, {}", trange(*t_start, *t_end)),
             Step::DiffractionStack { velocity, width } => format!("v={velocity:.3} m/ns, {width} traces"),
@@ -310,11 +310,19 @@ impl Step {
                 }
             }
             Step::TraceNormalize => {
+                let mut amplitudes = Vec::with_capacity(s.ns);
                 for t in 0..s.ntr {
                     let tr = o.trace_mut(t);
-                    let m = tr.iter().fold(0f32, |a, v| a.max(v.abs()));
-                    if m > 0.0 {
-                        tr.iter_mut().for_each(|v| *v /= m);
+                    if tr.is_empty() { continue; }
+                    for v in tr.iter_mut() {
+                        if !v.is_finite() { *v = 0.0; }
+                    }
+                    amplitudes.clear();
+                    amplitudes.extend(tr.iter().map(|v| v.abs()));
+                    let rank = ((0.9 * tr.len() as f32).round() as usize).clamp(1, tr.len()) - 1;
+                    let scale = *amplitudes.select_nth_unstable_by(rank, |a, b| a.total_cmp(b)).1;
+                    if scale > 0.0 {
+                        tr.iter_mut().for_each(|v| *v /= scale);
                     }
                 }
             }
@@ -1134,6 +1142,25 @@ pub fn snap_sample(tr: &[f32], s: f32, win: usize, mode: Snap) -> f32 {
             }
             best
         }
+    }
+}
+
+#[cfg(test)]
+mod trace_normalisation_tests {
+    use super::*;
+
+    #[test]
+    fn uses_matlab_ninetieth_percentile_and_handles_empty_scale() {
+        let mut s = Section::new(10, 3, 1.0);
+        s.trace_mut(0).copy_from_slice(&[-1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0, -8.0, -9.0, -100.0]);
+        s.trace_mut(1).copy_from_slice(&[f32::NAN, 0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0]);
+        s.trace_mut(2).copy_from_slice(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0]);
+        let out = Step::TraceNormalize.apply(&s, &Ctx::default()).unwrap();
+        assert!((out.trace(0)[9] + 100.0 / 9.0).abs() < 1e-6);
+        assert_eq!(out.trace(1)[0], 0.0);
+        assert!((out.trace(1)[9] - 16.0 / 14.0).abs() < 1e-6);
+        assert_eq!(out.trace(2)[9], 5.0);
+        assert!(out.data.iter().all(|v| v.is_finite()));
     }
 }
 

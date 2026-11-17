@@ -6,6 +6,7 @@ use crate::model::{GpsTrack, LinePick, Marker, MarkerType};
 use crate::model::Profile;
 use crate::processing::{Ctx, Progress, StepEntry};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize)]
@@ -50,8 +51,28 @@ pub struct ProjFile {
 }
 
 pub fn save(app: &App, path: &Path) -> Result<(), String> {
-    let s = serde_json::to_string_pretty(&build(app, path.parent())).map_err(|e| e.to_string())?;
-    std::fs::write(path, s).map_err(|e| e.to_string())
+    save_file(&build(app, path.parent()), path)
+}
+
+fn save_file(project: &ProjFile, path: &Path) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(project).map_err(|e| e.to_string())?;
+    let name = path.file_name().ok_or("project path has no file name")?.to_string_lossy();
+    for n in 0..100 {
+        let temp = path.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), n));
+        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        };
+        let result = file.write_all(&bytes).and_then(|_| file.sync_all());
+        drop(file);
+        let result = result.and_then(|_| std::fs::rename(&temp, path));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        return result.map_err(|e| e.to_string());
+    }
+    Err("could not create a temporary project file".into())
 }
 
 /// The project as it would be saved (compared with the last save to know about unsaved changes).
@@ -461,23 +482,24 @@ pub fn finish_collect(app: &mut App, job: CollectJob, r: CollectResult, cancelle
     let mut lines = vec![];
     let ok = !cancelled && r.errors.is_empty();
     if ok {
-        for p in app.profiles.iter_mut() {
-            if let Some((_, d)) = job.moved.iter().find(|(s, _)| *s == p.path) {
-                p.path = d.clone();
-            }
-            if let Some(g) = &mut p.gps {
-                if let Some((old, new)) = job.gps_renamed.iter().find(|(o, _)| g.source.starts_with(&format!("{o} ["))) {
-                    g.source = g.source.replacen(old.as_str(), new, 1);
-                }
-            }
+        let remap_path = |path: &Path| job.moved.iter().find(|(src, _)| src == path).map(|(_, dst)| dst.clone()).unwrap_or_else(|| path.to_path_buf());
+        let remap_gps = |source: &str| job.gps_renamed.iter().find(|(old, _)| source.starts_with(&format!("{old} [")))
+            .map(|(old, new)| source.replacen(old, new, 1)).unwrap_or_else(|| source.to_string());
+        let mut file = build(app, job.project.parent());
+        for (saved, live) in file.profiles.iter_mut().zip(&app.profiles) {
+            saved.path = rel(job.project.parent(), &remap_path(&live.path));
+            if let Some(gps) = &mut saved.gps { gps.source = remap_gps(&gps.source); }
         }
-        for b in app.basemaps.iter_mut() {
-            if let Some((_, d)) = job.moved.iter().find(|(s, _)| *s == b.path) {
-                b.path = d.clone();
-            }
+        for (saved, live) in file.basemaps.iter_mut().zip(&app.basemaps) {
+            saved.path = rel(job.project.parent(), &remap_path(&live.path));
         }
-        match save(app, &job.project) {
+        match save_file(&file, &job.project) {
             Ok(()) => {
+                for p in &mut app.profiles {
+                    p.path = remap_path(&p.path);
+                    if let Some(gps) = &mut p.gps { gps.source = remap_gps(&gps.source); }
+                }
+                for b in &mut app.basemaps { b.path = remap_path(&b.path); }
                 app.saved_snapshot = Some(snapshot(app));
                 if app.remember_projects {
                     crate::settings::set_last_project(&job.project);
@@ -610,6 +632,54 @@ mod topographic_project_tests {
 #[cfg(test)]
 mod collect_tests {
     use super::*;
+
+    #[test]
+    fn save_replaces_project_without_leaving_temporary_file() {
+        let root = PathBuf::from("target/project-save-test");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("survey.gprproj");
+        std::fs::write(&path, "old project").unwrap();
+        let app = App::headless(vec![], None);
+        save(&app, &path).unwrap();
+        assert_eq!(parse(&path).unwrap().profiles.len(), 0);
+        assert!(!root.join(format!(".survey.gprproj.{}.0.tmp", std::process::id())).exists());
+    }
+
+    #[test]
+    fn failed_save_cleans_up_temporary_file() {
+        let root = PathBuf::from("target/project-save-failure");
+        std::fs::create_dir_all(root.join("survey.gprproj")).unwrap();
+        let app = App::headless(vec![], None);
+        assert!(save(&app, &root.join("survey.gprproj")).is_err());
+        assert!(root.join("survey.gprproj").is_dir());
+        assert!(!root.join(format!(".survey.gprproj.{}.0.tmp", std::process::id())).exists());
+    }
+
+    #[test]
+    fn failed_collect_keeps_the_open_session_paths() {
+        let root = PathBuf::from("target/collect-save-failure");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut app = App::headless(vec![], None);
+        app.remember_projects = false;
+        app.add_profile(crate::demo::make().remove(0));
+        let original = app.profiles[0].path.clone();
+        let snapshot_before = snapshot(&app);
+        app.saved_snapshot = Some(snapshot_before.clone());
+        let job = CollectJob {
+            project: root.join("missing/survey.gprproj"),
+            copies: vec![],
+            moved: vec![(original.clone(), root.join("data/line.dzt"))],
+            gps_renamed: vec![],
+            skipped: vec![],
+            missing: vec![],
+        };
+        let result = CollectResult { copied: 1, bytes: 100, errors: vec![] };
+        let msg = finish_collect(&mut app, job, result, false);
+        assert!(msg.starts_with("Files copied, but the project could not be written"), "{msg}");
+        assert_eq!(app.profiles[0].path, original);
+        assert_eq!(app.saved_snapshot.as_deref(), Some(snapshot_before.as_str()));
+        assert!(app.project_path.is_none());
+    }
 
     fn write_dzt(path: &Path, ntr: usize, ns: usize, channels: usize) {
         let mut b = vec![0u8; 1024 + ntr * ns * channels * 2];

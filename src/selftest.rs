@@ -193,7 +193,7 @@ pub fn run(out: PathBuf, files: Vec<PathBuf>) -> i32 {
             topography: None,
             topography_error: None,
             steps: p.steps.clone(),
-            stages: vec![0, 2, 4],
+            stages: vec![0, 2, 3, 5],
             out_dir: out.clone(),
         };
         let (proc_ns, proc_c0, proc_max) = (p.proc.ns, p.coords[0], p.proc.data.iter().fold(0f32, |m, v| m.max(v.abs())));
@@ -204,7 +204,7 @@ pub fn run(out: PathBuf, files: Vec<PathBuf>) -> i32 {
         }
         println!("SEGY EXPORT: {}", a5.status);
         let opts = crate::formats::ImportOptions::default();
-        for tag in ["00_raw", "02_Subtract-mean_dewow", "04_Gain_function"] {
+        for tag in ["00_raw", "02_Subtract-mean_dewow", "03_Trace_normalisation", "05_Gain_function"] {
             let f = out.join(format!("DEMO_001_{tag}.sgy"));
             match crate::formats::load(&f, &opts) {
                 Ok(l) => {
@@ -213,8 +213,8 @@ pub fn run(out: PathBuf, files: Vec<PathBuf>) -> i32 {
                     let c0 = g.and_then(|g| g.fixes.first()).map(|f| (f.x, f.y, f.z));
                     let m = q.raw.data.iter().fold(0f32, |a, v| a.max(v.abs()));
                     println!("    {tag}: {} traces x {} samples, dt {:.4} ns, first coord {:?}, max|a| {:.1}", q.raw.ntr, q.raw.ns, q.raw.dt, c0, m);
-                    if tag.starts_with("04") && (q.raw.ns != proc_ns || (m - proc_max).abs() > proc_max * 1e-4) {
-                        println!("FAIL: stage 4 differs from the processed profile");
+                    if tag.starts_with("05") && (q.raw.ns != proc_ns || (m - proc_max).abs() > proc_max * 1e-4) {
+                        println!("FAIL: stage 5 differs from the processed profile");
                         fails += 1;
                     }
                     if let Some((x, y, _)) = c0 {
