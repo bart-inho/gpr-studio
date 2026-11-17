@@ -135,6 +135,13 @@ impl App {
             return;
         }
         self.plot_px = [plot.width(), plot.height()];
+        if self.fit_one_to_one.remove(&pid) {
+            // First display after loading: 1x1 from the start of the profile as displayed (left edge).
+            let start = if reversed { ntr } else { 0.0 };
+            if let Some(v) = self.one_to_one(a, &ViewState { tr0: start, tr1: start, s0: 0.0, s1: ns }) {
+                view = v;
+            }
+        }
         let resp = ui.interact(plot, ui.id().with("dataview"), Sense::click_and_drag());
         ui.allocate_rect(avail, Sense::hover());
 
@@ -252,7 +259,7 @@ impl App {
 
 
         // ---------------------------------------------------------- axes
-        let axis_col = Color32::from_gray(40);
+        let axis_col = ui.visuals().strong_text_color();
         let font = FontId::proportional(11.0);
         let depth_sec = p.proc.depth_axis;
         let y_top = p.proc.y_of(view.s0 - 0.5);
@@ -336,7 +343,7 @@ impl App {
             d += step;
         }
         let src = if migrated || p.use_gps_distance && p.has_coords() { "from GPS".to_string() } else { format!("trace spacing {} m", format!("{:.6}", p.dx).trim_end_matches('0').trim_end_matches('.')) };
-        painter.text(Pos2::new(plot.left(), avail.top() + 2.0), Align2::LEFT_TOP, format!("distance [m] · {src}"), font.clone(), Color32::GRAY);
+        painter.text(Pos2::new(plot.left(), avail.top() + 2.0), Align2::LEFT_TOP, format!("distance [m] · {src}"), font.clone(), ui.visuals().weak_text_color());
 
         // ---------------------------------------------------------- picks overlay
         let marker_pos = |m: &Marker| -> Pos2 {
@@ -630,7 +637,7 @@ impl App {
             let sa = (view.s0 - off).max(0.0) as usize;
             let sb = ((view.s1 - off).ceil().max(0.0) as usize).min(p.proc.ns);
             let pts: Vec<Pos2> = (sa..sb).map(|s| Pos2::new(arect.center().x + (col[s] / (clip * 1.5)).clamp(-1.0, 1.0) * ascan_w * 0.48, fr.y_of_sample(s as f32 + off))).collect();
-            ap.add(egui::Shape::line(pts, Stroke::new(1.0, Color32::from_rgb(20, 60, 160))));
+            ap.add(egui::Shape::line(pts, Stroke::new(1.0, Color32::BLACK)));
         }
         ap.text(arect.left_top() + egui::vec2(3.0, 2.0), Align2::LEFT_TOP, format!("trace {}", tr_show + 1), FontId::proportional(10.5), Color32::DARK_GRAY);
     }

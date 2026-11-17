@@ -94,3 +94,8 @@ pub fn fmt_tick(v: f64, step: f64) -> String {
         format!("{v:.3}")
     }
 }
+
+/// Orange for warnings, readable on the light and the dark theme.
+pub fn warn_color(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode { Color32::from_rgb(255, 170, 70) } else { Color32::from_rgb(180, 90, 0) }
+}

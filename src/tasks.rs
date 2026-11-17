@@ -18,6 +18,7 @@ pub enum Pending {
     Import(Vec<PathBuf>),
     Project(PathBuf),
     Segy(Vec<crate::segy_export::SegyJob>),
+    Collect(Box<crate::project::CollectJob>),
 }
 
 pub enum Output {
@@ -25,6 +26,7 @@ pub enum Output {
     Imported(Vec<Profile>, Vec<String>),
     Project(Box<crate::project::Loaded>),
     Exported(Vec<String>, Vec<String>),
+    Collected(Box<crate::project::CollectJob>, crate::project::CollectResult),
 }
 
 pub struct Task {
@@ -152,6 +154,13 @@ impl App {
                 let n = jobs.len();
                 self.start_task(format!("Exporting SEG-Y ({n} profile(s))"), true, move |prog| crate::segy_export::run_and_report(jobs, prog));
             }
+            Pending::Collect(job) => {
+                let n = job.copies.len();
+                self.start_task(format!("Collecting project ({n} files)"), true, move |prog| {
+                    let r = crate::project::run_collect(&job, &prog);
+                    Output::Collected(job, r)
+                });
+            }
             Pending::Project(path) => {
                 let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("project").to_string();
                 match crate::project::parse(&path) {
@@ -207,6 +216,11 @@ impl App {
                 } else {
                     format!("SEG-Y export{c}: {} file(s) written to {dir}; problems: {}", files.len(), errors.join(" | "))
                 };
+            }
+            Output::Collected(job, r) => {
+                let text = crate::project::finish_collect(self, *job, r, cancelled);
+                self.status = text.lines().next().unwrap_or("").to_string();
+                self.collect_report = Some(text);
             }
             Output::Project(loaded) => {
                 let msg = crate::project::apply(self, *loaded);

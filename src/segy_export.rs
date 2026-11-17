@@ -6,7 +6,7 @@
 use crate::app::App;
 use crate::model::Section;
 use crate::processing::{Ctx, Progress, StepEntry};
-use egui::{Color32, RichText};
+use egui::RichText;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -353,11 +353,11 @@ impl App {
                 go = true;
             }
             if self.busy() {
-                ui.colored_label(Color32::from_rgb(170, 90, 0), "Another job is running; the export will start after it.");
+                ui.colored_label(crate::draw::warn_color(ui), "Another job is running; the export will start after it.");
             }
         });
         if go {
-            if let Some(dir) = rfd::FileDialog::new().set_title("Folder for the SEG-Y files").pick_folder() {
+            if let Some(dir) = self.export_dialog().set_title("Folder for the SEG-Y files").pick_folder() {
                 let stages: Vec<usize> = self.segy_sel.iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| i).collect();
                 let idx: Vec<usize> = if self.segy_all { (0..self.profiles.len()).collect() } else { vec![a] };
                 let geographic = self.is_geographic();

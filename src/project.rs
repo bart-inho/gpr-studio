@@ -50,16 +50,36 @@ pub struct ProjFile {
 }
 
 pub fn save(app: &App, path: &Path) -> Result<(), String> {
-    let s = serde_json::to_string_pretty(&build(app)).map_err(|e| e.to_string())?;
+    let s = serde_json::to_string_pretty(&build(app, path.parent())).map_err(|e| e.to_string())?;
     std::fs::write(path, s).map_err(|e| e.to_string())
 }
 
 /// The project as it would be saved (compared with the last save to know about unsaved changes).
 pub fn snapshot(app: &App) -> String {
-    serde_json::to_string(&build(app)).unwrap_or_default()
+    serde_json::to_string(&build(app, None)).unwrap_or_default()
 }
 
-fn build(app: &App) -> ProjFile {
+/// A path inside `base` is written relative to it with '/' (opens on any system); others stay absolute.
+fn rel(base: Option<&Path>, p: &Path) -> PathBuf {
+    match base.filter(|b| !b.as_os_str().is_empty()).and_then(|b| p.strip_prefix(b).ok()) {
+        Some(r) => PathBuf::from(r.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")),
+        None => p.to_path_buf(),
+    }
+}
+
+/// A path from a project file: relative ones are inside the project's folder. A missing file is also
+/// looked for by name in the project's data folders (project moved to another computer).
+fn resolve(base: &Path, p: &Path) -> PathBuf {
+    let direct = if p.is_absolute() { p.to_path_buf() } else { base.join(p) };
+    if direct.exists() {
+        return direct;
+    }
+    let s = p.to_string_lossy();
+    let name = s.rsplit(['/', '\\']).next().unwrap_or("");
+    ["data", "data/basemaps"].iter().map(|d| base.join(d).join(name)).find(|c| !name.is_empty() && c.is_file()).unwrap_or(direct)
+}
+
+fn build(app: &App, base: Option<&Path>) -> ProjFile {
     ProjFile {
         version: 2,
         crs: app.project_crs.clone(),
@@ -69,7 +89,7 @@ fn build(app: &App) -> ProjFile {
             .map(|p| ProjProfile {
                 id: p.id,
                 name: p.name.clone(),
-                path: p.path.clone(),
+                path: rel(base, &p.path),
                 channel: p.channel,
                 dx: p.dx,
                 velocity: p.velocity,
@@ -85,7 +105,7 @@ fn build(app: &App) -> ProjFile {
         marker_types: app.marker_types.clone(),
         markers: app.markers.clone(),
         lines: app.lines.clone(),
-        basemaps: app.basemaps.iter().map(|b| ProjBasemap { path: b.path.clone(), crs: b.crs.clone(), visible: b.visible, opacity: b.opacity }).collect(),
+        basemaps: app.basemaps.iter().map(|b| ProjBasemap { path: rel(base, &b.path), crs: b.crs.clone(), visible: b.visible, opacity: b.opacity }).collect(),
         next_pick_id: app.next_pick_id,
         import: app.import_opts.clone(),
     }
@@ -109,7 +129,11 @@ pub struct Loaded {
 pub fn load_profiles(mut file: ProjFile, path: PathBuf, prog: &std::sync::Arc<Progress>) -> Loaded {
     let mut profiles = Vec::new();
     let mut missing = Vec::new();
-    let list = std::mem::take(&mut file.profiles);
+    let mut list = std::mem::take(&mut file.profiles);
+    let base = path.parent().unwrap_or(Path::new("")).to_path_buf();
+    for pp in list.iter_mut() {
+        pp.path = resolve(&base, &pp.path);
+    }
     let mut remaining = std::collections::HashMap::<PathBuf, usize>::new();
     for pp in &list { *remaining.entry(pp.path.clone()).or_default() += 1; }
     let mut sources = std::collections::HashMap::<PathBuf, Vec<Option<Profile>>>::new();
@@ -219,9 +243,11 @@ pub fn apply(app: &mut App, l: Loaded) -> String {
         }
     }
     app.next_pick_id = f.next_pick_id.max(app.markers.iter().map(|m| m.id).chain(app.lines.iter().map(|l| l.id)).max().unwrap_or(0) + 1);
+    let base = l.path.parent().unwrap_or(Path::new("")).to_path_buf();
     for b in f.basemaps {
-        if b.path.exists() {
-            app.add_basemap(b.path);
+        let path = resolve(&base, &b.path);
+        if path.exists() {
+            app.add_basemap(path);
         }
     }
     app.reproject_all();
@@ -240,6 +266,304 @@ pub fn apply(app: &mut App, l: Loaded) -> String {
         format!("Project {name} opened: {} profiles.", app.profiles.len())
     } else {
         format!("Project {name} opened; not loaded: {}", l.missing.join(", "))
+    }
+}
+
+// ------------------------------------------------------------ Collect and save
+
+/// Everything to copy for "Collect and save", planned on the UI thread (only quick file checks).
+pub struct CollectJob {
+    /// The new project file, `<folder>/<name>.gprproj`.
+    pub project: PathBuf,
+    /// (source, destination) for every file, once each.
+    pub copies: Vec<(PathBuf, PathBuf)>,
+    /// Profile and basemap files: original path → collected path.
+    pub moved: Vec<(PathBuf, PathBuf)>,
+    /// GPS files that had to be renamed: (old file name, new file name).
+    pub gps_renamed: Vec<(String, String)>,
+    pub skipped: Vec<String>,
+    pub missing: Vec<String>,
+}
+
+pub struct CollectResult {
+    pub copied: usize,
+    pub bytes: u64,
+    pub errors: Vec<String>,
+}
+
+/// Files a reader in formats.rs opens next to the data file (with the extension case it looks for).
+fn data_companions(p: &Path) -> Vec<PathBuf> {
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_string();
+    let lists: Vec<Vec<String>> = match ext.to_ascii_lowercase().as_str() {
+        "rd3" | "rd7" => vec![vec!["rad".into(), "RAD".into()]],
+        "iprb" => vec![vec!["iprh".into(), "IPRH".into()]],
+        "dt1" => vec![vec!["hd".into(), "HD".into()]],
+        // REFLEXW: data .??T with header .??R of the same case (read_reflexw).
+        e if e.len() == 3 && e.as_bytes()[0].is_ascii_digit() && e.as_bytes()[1].is_ascii_digit() && e.ends_with('t') => {
+            vec![vec![format!("{}{}", &ext[..2], if ext.ends_with('T') { 'R' } else { 'r' })]]
+        }
+        _ => vec![],
+    };
+    lists.iter().filter_map(|l| l.iter().map(|e| p.with_extension(e)).find(|c| c.is_file())).collect()
+}
+
+/// World and aux files next to a basemap.
+fn basemap_companions(p: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = ["tfw", "TFW", "tifw", "TIFW", "wld", "WLD", "prj", "PRJ", "aux.xml", "AUX.XML"].iter().map(|e| p.with_extension(e)).collect();
+    v.extend(p.file_name().map(|n| p.with_file_name(format!("{}.aux.xml", n.to_string_lossy()))));
+    let mut out: Vec<PathBuf> = Vec::new();
+    for c in v {
+        // Case-insensitive file systems report both spellings: keep one.
+        let key = c.to_string_lossy().to_lowercase();
+        if c.is_file() && !out.iter().any(|o| o.to_string_lossy().to_lowercase() == key) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+}
+
+/// Pick destination names for a file and its companions in `dir` (`stem`, then `stem_2`, …), so that
+/// pairs keep one stem and nothing already there is overwritten. Returns (source, destination) pairs.
+fn place(main: &Path, companions: &[PathBuf], dir: &Path, used: &mut std::collections::HashSet<String>) -> Vec<(PathBuf, PathBuf)> {
+    let stem = main.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let suffix = |f: &Path| f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default().get(stem.len()..).unwrap_or("").to_string();
+    let files: Vec<(PathBuf, String)> = std::iter::once(main.to_path_buf()).chain(companions.iter().cloned()).map(|f| { let s = suffix(&f); (f, s) }).collect();
+    for k in 1.. {
+        let st = if k == 1 { stem.clone() } else { format!("{stem}_{k}") };
+        let pairs: Vec<(PathBuf, PathBuf)> = files.iter().map(|(f, sfx)| (f.clone(), dir.join(format!("{st}{sfx}")))).collect();
+        let free = pairs.iter().all(|(src, d)| !used.contains(&d.to_string_lossy().to_lowercase()) && (!d.exists() || same_file(src, d)));
+        if free {
+            for (_, d) in &pairs {
+                used.insert(d.to_string_lossy().to_lowercase());
+            }
+            return pairs;
+        }
+    }
+    unreachable!()
+}
+
+/// Plan the copy of every file the project uses into `<folder>/data`.
+pub fn plan_collect(app: &App, folder: &Path, name: &str) -> CollectJob {
+    let (data, gps_dir, maps) = (folder.join("data"), folder.join("data").join("gps"), folder.join("data").join("basemaps"));
+    let mut job = CollectJob { project: folder.join(format!("{name}.gprproj")), copies: vec![], moved: vec![], gps_renamed: vec![], skipped: vec![], missing: vec![] };
+    let mut used = std::collections::HashSet::new();
+    let mut gps_done = std::collections::HashSet::new();
+    let mut gps_lists: std::collections::HashMap<Vec<PathBuf>, Vec<PathBuf>> = Default::default();
+    for p in &app.profiles {
+        if p.path.extension().and_then(|e| e.to_str()) == Some("demo") {
+            job.skipped.push(format!("{} (demo profile, no file)", p.name));
+            continue;
+        }
+        if job.moved.iter().any(|(src, _)| *src == p.path) {
+            continue; // another channel of the same file
+        }
+        if !p.path.is_file() {
+            job.missing.push(p.path.display().to_string());
+            continue;
+        }
+        let pairs = place(&p.path, &data_companions(&p.path), &data, &mut used);
+        job.moved.push((p.path.clone(), pairs[0].1.clone()));
+        job.copies.extend(pairs);
+        // GPS files: the one named in the track, and any with the data file's name.
+        let dirs = crate::gps::search_dirs(&p.path, None);
+        let mut found: Vec<PathBuf> = Vec::new();
+        if let Some(g) = &p.gps {
+            let fname = g.source.split(" [").next().unwrap_or("");
+            found.extend(dirs.iter().map(|d| d.join(fname)).find(|c| !fname.is_empty() && c.is_file()));
+        }
+        let stem = p.path.file_stem().map(|s| s.to_string_lossy().to_lowercase());
+        let list = gps_lists.entry(dirs.clone()).or_insert_with(|| crate::gps::list_gps_files(&dirs));
+        found.extend(list.iter().filter(|f| f.file_stem().map(|s| s.to_string_lossy().to_lowercase()) == stem).cloned());
+        for f in found {
+            if !gps_done.insert(f.clone()) {
+                continue;
+            }
+            let pair = place(&f, &[], &gps_dir, &mut used).remove(0);
+            let (old, new) = (f.file_name().unwrap_or_default().to_string_lossy().to_string(), pair.1.file_name().unwrap_or_default().to_string_lossy().to_string());
+            if old != new {
+                job.gps_renamed.push((old, new));
+            }
+            job.copies.push(pair);
+        }
+    }
+    for b in &app.basemaps {
+        if job.moved.iter().any(|(src, _)| *src == b.path) {
+            continue;
+        }
+        if !b.path.is_file() {
+            job.missing.push(b.path.display().to_string());
+            continue;
+        }
+        let pairs = place(&b.path, &basemap_companions(&b.path), &maps, &mut used);
+        job.moved.push((b.path.clone(), pairs[0].1.clone()));
+        job.copies.extend(pairs);
+    }
+    // A file already in place (collecting into the same folder again) is not copied onto itself.
+    job.copies.retain(|(src, dst)| !same_file(src, dst));
+    job
+}
+
+/// Copy the files (background thread). Nothing is ever deleted; a cancel stops after the current block.
+pub fn run_collect(job: &CollectJob, prog: &Progress) -> CollectResult {
+    use std::io::{Read, Write};
+    let total: u64 = job.copies.iter().map(|(s, _)| s.metadata().map(|m| m.len()).unwrap_or(0)).sum::<u64>().max(1);
+    let mut r = CollectResult { copied: 0, bytes: 0, errors: vec![] };
+    let mut buf = vec![0u8; 8 << 20];
+    for (src, dst) in &job.copies {
+        if prog.is_cancelled() {
+            break;
+        }
+        prog.set_text(src.file_name().unwrap_or_default().to_string_lossy().to_string());
+        let res = (|| -> std::io::Result<()> {
+            if let Some(d) = dst.parent() {
+                std::fs::create_dir_all(d)?;
+            }
+            let mut i = std::fs::File::open(src)?;
+            let mut o = std::fs::File::create(dst)?;
+            loop {
+                let n = i.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                o.write_all(&buf[..n])?;
+                r.bytes += n as u64;
+                prog.set(r.bytes as f32 / total as f32);
+                if prog.is_cancelled() {
+                    return Err(std::io::Error::other("cancelled"));
+                }
+            }
+            o.sync_all()
+        })();
+        match res {
+            Ok(()) => r.copied += 1,
+            Err(e) => r.errors.push(format!("{}: {e}", src.display())),
+        }
+    }
+    prog.set(1.0);
+    r
+}
+
+fn size_text(b: u64) -> String {
+    match b {
+        b if b >= 1 << 30 => format!("{:.2} GB", b as f64 / (1u64 << 30) as f64),
+        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+        b => format!("{:.0} kB", b as f64 / 1024.0),
+    }
+}
+
+/// After the copy: point the session at the collected files and save the project there.
+/// Returns the summary (first line for the status bar).
+pub fn finish_collect(app: &mut App, job: CollectJob, r: CollectResult, cancelled: bool) -> String {
+    let mut lines = vec![];
+    let ok = !cancelled && r.errors.is_empty();
+    if ok {
+        for p in app.profiles.iter_mut() {
+            if let Some((_, d)) = job.moved.iter().find(|(s, _)| *s == p.path) {
+                p.path = d.clone();
+            }
+            if let Some(g) = &mut p.gps {
+                if let Some((old, new)) = job.gps_renamed.iter().find(|(o, _)| g.source.starts_with(&format!("{o} ["))) {
+                    g.source = g.source.replacen(old.as_str(), new, 1);
+                }
+            }
+        }
+        for b in app.basemaps.iter_mut() {
+            if let Some((_, d)) = job.moved.iter().find(|(s, _)| *s == b.path) {
+                b.path = d.clone();
+            }
+        }
+        match save(app, &job.project) {
+            Ok(()) => {
+                app.saved_snapshot = Some(snapshot(app));
+                if app.remember_projects {
+                    crate::settings::set_last_project(&job.project);
+                }
+                app.project_path = Some(job.project.clone());
+                lines.push(format!("Project collected: {} ({} files copied, {}).", job.project.display(), r.copied, size_text(r.bytes)));
+            }
+            Err(e) => lines.push(format!("Files copied, but the project could not be written: {e}")),
+        }
+    } else {
+        let why = if cancelled { "cancelled" } else { "failed" };
+        lines.push(format!("Collect {why}: {} files copied ({}); the project file was not written and the session is unchanged.", r.copied, size_text(r.bytes)));
+    }
+    for e in &r.errors {
+        lines.push(format!("Error: {e}"));
+    }
+    for m in &job.missing {
+        lines.push(format!("Missing (not copied): {m}"));
+    }
+    for s in &job.skipped {
+        lines.push(format!("Skipped: {s}"));
+    }
+    lines.join("\n")
+}
+
+impl App {
+    /// File › Collect and save project…: ask for the folder and name.
+    pub fn collect_dialog(&mut self) {
+        let name = self.project_path.as_ref().and_then(|p| p.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "survey".into());
+        let mut dlg = rfd::FileDialog::new().set_title("Collect and save project: folder and project name").set_file_name(&name);
+        if let Some(d) = self.project_path.as_ref().and_then(|p| p.parent()) {
+            dlg = dlg.set_directory(d);
+        }
+        let Some(f) = dlg.save_file() else { return };
+        let name = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or(name);
+        let folder = f.with_file_name(&name);
+        let not_empty = std::fs::read_dir(&folder).map(|mut d| d.next().is_some()).unwrap_or(false);
+        if not_empty {
+            self.collect_confirm = Some(folder);
+        } else {
+            self.start_collect(folder);
+        }
+    }
+
+    pub fn start_collect(&mut self, folder: PathBuf) {
+        let name = folder.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "survey".into());
+        let job = plan_collect(self, &folder, &name);
+        self.task_queue.push_back(crate::tasks::Pending::Collect(Box::new(job)));
+    }
+
+    /// The question for a folder that is not empty, and the summary afterwards.
+    pub fn collect_windows(&mut self, ctx: &egui::Context) {
+        if let Some(folder) = self.collect_confirm.clone() {
+            let mut choice = 0;
+            egui::Modal::new(egui::Id::new("collect_confirm")).show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.heading("Folder is not empty");
+                ui.label(format!("{} already contains files. Write the project into it? Existing files are kept; new files with the same name get a _2 ending.", folder.display()));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(egui::RichText::new("  Continue  ").strong()).fill(ui.visuals().selection.bg_fill)).clicked() {
+                        choice = 1;
+                    }
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        choice = 2;
+                    }
+                });
+            });
+            if choice > 0 {
+                self.collect_confirm = None;
+            }
+            if choice == 1 {
+                self.start_collect(folder);
+            }
+        }
+        let mut open = self.collect_report.is_some();
+        if let Some(text) = &self.collect_report {
+            egui::Window::new("Collect and save project").open(&mut open).resizable(false).show(ctx, |ui| {
+                for l in text.lines() {
+                    ui.label(l);
+                }
+            });
+        }
+        if !open {
+            self.collect_report = None;
+        }
     }
 }
 
@@ -280,6 +604,94 @@ mod topographic_project_tests {
         assert!(reopened.profiles[0].proc.data.iter().zip(&app.profiles[0].proc.data).all(|(a,b)| a.is_nan() == b.is_nan()));
         let pdf = PathBuf::from("target/topographic-report-test.pdf");
         assert!(crate::report::export(&reopened, &pdf).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod collect_tests {
+    use super::*;
+
+    fn write_dzt(path: &Path, ntr: usize, ns: usize, channels: usize) {
+        let mut b = vec![0u8; 1024 + ntr * ns * channels * 2];
+        b[0..2].copy_from_slice(&255u16.to_le_bytes());
+        b[2..4].copy_from_slice(&1u16.to_le_bytes());
+        b[4..6].copy_from_slice(&(ns as u16).to_le_bytes());
+        b[6..8].copy_from_slice(&16u16.to_le_bytes());
+        b[14..18].copy_from_slice(&20f32.to_le_bytes());
+        b[26..30].copy_from_slice(&64f32.to_le_bytes());
+        b[52..54].copy_from_slice(&(channels as u16).to_le_bytes());
+        std::fs::write(path, b).unwrap();
+    }
+
+    fn write_mala(dir: &Path, stem: &str, ns: usize) {
+        std::fs::write(dir.join(format!("{stem}.rad")), format!("SAMPLES:{ns}\nFREQUENCY:5000\nDISTANCE INTERVAL:0.05\n")).unwrap();
+        std::fs::write(dir.join(format!("{stem}.rd3")), vec![1u8; ns * 2 * 30]).unwrap();
+    }
+
+    #[test]
+    fn collected_project_opens_after_the_folder_is_moved() {
+        let root = PathBuf::from("target/collect-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let (a, b) = (root.join("src/a"), root.join("src/b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        // Two different header/data pairs with the same name, a two-channel file and its GPS file.
+        write_mala(&a, "line", 64);
+        write_mala(&b, "line", 32);
+        write_dzt(&a.join("multi.dzt"), 20, 64, 2);
+        std::fs::write(a.join("multi.dzg"), "$GSSIS,0\n").unwrap();
+        // A small TIFF basemap with a world file.
+        let tif = root.join("src/map.tif");
+        let mut enc = tiff::encoder::TiffEncoder::new(std::fs::File::create(&tif).unwrap()).unwrap();
+        enc.write_image::<tiff::encoder::colortype::Gray8>(4, 4, &[128u8; 16]).unwrap();
+        std::fs::write(root.join("src/map.tfw"), "1\n0\n0\n-1\n2600000\n1200004\n").unwrap();
+
+        let mut app = App::headless(vec![], None);
+        app.remember_projects = false;
+        app.import_files_now(vec![a.join("line.rd3"), b.join("line.rd3"), a.join("multi.dzt")]);
+        assert_eq!(app.profiles.len(), 4, "{}", app.status);
+        app.add_basemap(tif);
+        app.wait_jobs();
+        assert_eq!(app.basemaps.len(), 1, "{}", app.status);
+
+        let job = plan_collect(&app, &root.join("proj"), "proj");
+        let r = run_collect(&job, &Progress::new());
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.copied, 8); // 2×(rd3+rad), dzt, dzg, tif, tfw — the shared dzt once
+        let msg = finish_collect(&mut app, job, r, false);
+        assert!(msg.starts_with("Project collected"), "{msg}");
+        let data = root.join("proj/data");
+        for f in ["line.rd3", "line.rad", "line_2.rd3", "line_2.rad", "multi.dzt", "gps/multi.dzg", "basemaps/map.tif", "basemaps/map.tfw"] {
+            assert!(data.join(f).is_file(), "{f} missing");
+        }
+        let text = std::fs::read_to_string(root.join("proj/proj.gprproj")).unwrap();
+        assert!(text.contains("\"data/line_2.rd3\"") && text.contains("\"data/basemaps/map.tif\""), "{text}");
+
+        // Move the folder (as if sent to another computer) and delete the originals.
+        std::fs::rename(root.join("proj"), root.join("moved")).unwrap();
+        std::fs::remove_dir_all(root.join("src")).unwrap();
+        let path = root.join("moved/proj.gprproj");
+        let loaded = load_profiles(parse(&path).unwrap(), path, &Progress::new());
+        assert!(loaded.missing.is_empty(), "{:?}", loaded.missing);
+        let mut reopened = App::headless(vec![], None);
+        reopened.remember_projects = false;
+        apply(&mut reopened, loaded);
+        reopened.wait_jobs();
+        assert_eq!(reopened.profiles.len(), 4);
+        assert_eq!(reopened.basemaps.len(), 1, "{}", reopened.status);
+        assert!(reopened.profiles.iter().all(|p| p.path.starts_with(root.join("moved/data"))));
+        assert_eq!(reopened.profiles.iter().filter(|p| p.raw.ns == 32).count(), 1); // the renamed pair kept its own header
+    }
+
+    #[test]
+    fn missing_absolute_path_falls_back_to_the_data_folder() {
+        let root = PathBuf::from("target/collect-fallback");
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::write(root.join("data/x.dzt"), b"").unwrap();
+        assert_eq!(resolve(&root, Path::new("/nowhere/else/x.dzt")), root.join("data/x.dzt"));
+        assert_eq!(resolve(&root, Path::new("C:\\survey\\x.dzt")), root.join("data/x.dzt"));
+        assert_eq!(resolve(&root, Path::new("data/x.dzt")), root.join("data/x.dzt"));
+        assert_eq!(rel(Some(&root), &root.join("data").join("x.dzt")), PathBuf::from("data/x.dzt"));
     }
 }
 

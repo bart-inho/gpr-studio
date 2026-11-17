@@ -417,6 +417,13 @@ impl Profile {
         let s = traces as f64 * m_per_tr / m_per_s * (plot[1] / plot[0]) as f64;
         (s.is_finite() && s > 0.0).then_some(s as f32)
     }
+
+    /// Trace span that shows `samples` samples at 1:1 in a plot of `plot` points (inverse of `one_to_one_samples`).
+    pub fn one_to_one_traces(&self, samples: f32, plot: [f32; 2]) -> Option<f32> {
+        let per_trace = self.one_to_one_samples(1.0, plot)?;
+        let t = samples / per_trace;
+        (t.is_finite() && t > 0.0).then_some(t)
+    }
 }
 
 fn interp_fix(fixes: &[(f64, [f64; 3])], t: f64) -> [f64; 3] {
@@ -559,6 +566,22 @@ mod orientation_tests {
         assert_eq!(p.auto_orientation(&crs), Some(false)); // southbound
         p.coords[1] = p.coords[0];
         assert_eq!(p.auto_orientation(&crs), None);
+    }
+
+    #[test]
+    fn one_to_one_traces_inverts_samples() {
+        // 101 traces over 5 m (0.05 m/trace); dt 0.2 ns at v 0.1 m/ns = 0.01 m/sample.
+        let mut p = Profile::new("test".into(), PathBuf::new(), "test", Section::new(200, 101, 0.2), 0.05);
+        p.use_gps_distance = false;
+        p.update_distance();
+        let plot = [800.0, 400.0];
+        let wtr = p.one_to_one_traces(200.0, plot).unwrap();
+        // 200 samples = 2 m over 400 px -> 0.005 m/px; 800 px wide = 4 m = 80 traces.
+        assert!((wtr - 80.0).abs() < 1e-3, "{wtr}");
+        assert!((p.one_to_one_samples(wtr, plot).unwrap() - 200.0).abs() < 1e-3);
+        p.dx = 0.0;
+        p.update_distance();
+        assert!(p.one_to_one_traces(200.0, plot).is_none());
     }
 
     #[test]

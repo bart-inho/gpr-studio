@@ -78,7 +78,7 @@ impl App {
                 ui.label(format!("GPS file found automatically for {found} of {n}{emb}."));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let yes = ui.add(egui::Button::new(RichText::new("  Yes  ").strong()).fill(Color32::from_rgb(200, 225, 255)));
+                    let yes = ui.add(egui::Button::new(RichText::new("  Yes  ").strong()).fill(ui.visuals().selection.bg_fill));
                     if yes.clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         b.asked = true;
                     }

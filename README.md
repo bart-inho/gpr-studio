@@ -11,6 +11,8 @@ picking, mapping and reporting. Written in Rust with egui; runs on Windows, macO
   SEG-Y trace headers) are matched automatically by file name, including channel endings such as `_0`/`_1`.
 - **Map** – GPS tracks of every profile, the part shown in the data view highlighted, markers and layer picks,
   GeoTIFF basemaps of any size, any output coordinate system (EPSG code or PROJ string; default EPSG:2056).
+  The map sits on the right, at the bottom of the main window (full width for long profiles) or in its own
+  window (buttons in the map header, or the Map menu); the choice is kept for the next start.
 - **Processing** – set time zero, dewow, DC shift, background removal, bandpass (FFT and Butterworth),
   AGC (optionally with the gain smoothed over neighbouring traces), energy decay, gain function,
   divergence compensation, trace normalisation, running (moving) average over traces, average xy-filter,
@@ -22,13 +24,24 @@ picking, mapping and reporting. Written in Rust with egui; runs on Windows, macO
   Ctrl + wheel zooms horizontally (short profiles are drawn narrower at the same scale, never stretched).
   **Orient profiles**, next to Fit, uses GPS to display each profile west-to-east or north-to-south
   along its dominant direction. Source traces and pick indices remain in acquisition order; the
-  display direction is saved in the project.
+  display direction is saved in the project. **1x1 ratio** always shows the whole height of the section and
+  only changes the horizontal span (around the current centre) so that one metre is as long horizontally
+  as vertically; time sections use the toolbar velocity. A profile too short to fill the width is drawn narrower.
 - **Picking** – typed point markers, hyperbola velocity fitting, layer lines with phase following and snapping.
 - **Export** – GeoPackage (profiles, markers, layer picks, trace points), SEG-Y of chosen processing steps,
   PDF report (radargram + map with the same section highlighted), CSV of picks.
 - **Projects** – `.gprproj` files keep the file list, processing, GPS, picks, CRS and basemaps.
   Ctrl+S saves to the project's file, File › Open last project reopens the previous one, and closing only
-  asks to save when something changed.
+  asks to save when something changed. Files inside the project's folder are stored with relative paths;
+  a missing file is also looked for by name in the project's `data/` folder.
+  **File › Collect and save project…** copies the project and every file it uses (data files with their
+  headers such as `.rad`/`.iprh`/`.hd`/REFLEXW `.??R`, original GPS files, GeoTIFFs with their world files)
+  into one folder (`<name>/<name>.gprproj`, `<name>/data/`, `data/gps/`, `data/basemaps/`) that can be zipped
+  and opened on another computer. Files with the same name get a `_2` ending; nothing is overwritten or
+  deleted. Demo profiles have no file and are skipped.
+- **Settings** – File › Settings…: dark mode, and a default folder where the export dialogs (GeoPackage,
+  PDF, picks CSV, SEG-Y) start. Saved in `%APPDATA%\GPRStudio\settings.json` (Windows) or
+  `~/.config/GPRStudio/settings.json`.
 
 ## Topographic Kirchhoff migration
 

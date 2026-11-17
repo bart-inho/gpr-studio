@@ -29,6 +29,15 @@ pub enum YAxis {
     Depth,
 }
 
+/// Where the GPS map is shown.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum MapPlacement {
+    #[default]
+    Right,
+    Bottom,
+    Window,
+}
+
 #[derive(Clone, Debug)]
 pub struct ViewState {
     pub tr0: f32,
@@ -136,7 +145,8 @@ pub struct App {
     pub basemaps: Vec<Basemap>,
     pub basemap_jobs: Vec<BasemapJob>,
     pub show_map: bool,
-    pub map_detached: bool,
+    /// Last docked placement (Right or Bottom), restored when the map window is closed.
+    pub map_dock: MapPlacement,
     pub step_editor: Option<StepEditor>,
     pub show_marker_table: bool,
     pub show_marker_types: bool,
@@ -166,21 +176,83 @@ pub struct App {
     pub topo_shown: HashMap<u32, bool>,
     /// Last radargram plot size in points (for the 1x1 ratio button).
     pub plot_px: [f32; 2],
+    /// Profiles just loaded: shown at 1x1 the first time the data view draws them.
+    pub fit_one_to_one: std::collections::HashSet<u32>,
     /// Show topography (one setting for every profile).
     pub show_topo: bool,
     /// The project as last saved or opened (None = never saved).
     pub saved_snapshot: Option<String>,
     /// Remember opened/saved projects as "last project" (off in the self-test).
     pub remember_projects: bool,
+    /// User settings (theme, export folder, map placement); saved when they change.
+    pub settings: crate::settings::Settings,
+    pub show_settings: bool,
+    /// Collect and save: folder waiting for confirmation (exists and is not empty).
+    pub collect_confirm: Option<PathBuf>,
+    /// Collect and save: summary shown in a small window.
+    pub collect_report: Option<String>,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext, files: Vec<PathBuf>, screenshot: Option<PathBuf>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::light());
-        let mut style = (*cc.egui_ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-        cc.egui_ctx.set_style(style);
-        Self::headless(files, screenshot)
+        let mut app = Self::headless(files, screenshot);
+        if app.screenshot.is_none() {
+            app.settings = crate::settings::load();
+        } else {
+            // Test switches for pictures: dark theme, map at the bottom. The user's settings are not read.
+            app.settings.dark_mode = std::env::var("GPRSTUDIO_SHOT_DARK").is_ok();
+            if std::env::var("GPRSTUDIO_SHOT_MAP_BOTTOM").is_ok() {
+                app.settings.map_placement = MapPlacement::Bottom;
+            }
+        }
+        if app.settings.map_placement != MapPlacement::Window {
+            app.map_dock = app.settings.map_placement;
+        }
+        // set_theme (not set_visuals): eframe would otherwise follow the system theme.
+        cc.egui_ctx.set_theme(if app.settings.dark_mode { egui::Theme::Dark } else { egui::Theme::Light });
+        cc.egui_ctx.all_styles_mut(|style| style.spacing.item_spacing = egui::vec2(6.0, 4.0));
+        app
+    }
+
+    /// Write the settings file (never from the self-test, tests or screenshots).
+    pub fn save_settings(&self) {
+        if self.remember_projects && self.screenshot.is_none() {
+            let mut s = self.settings.clone();
+            // The last project is written separately; keep the file's value.
+            s.last_project = crate::settings::last_project();
+            crate::settings::save(&s);
+        }
+    }
+
+    /// The 1x1 view of profile `i` around the centre of `v` (None without spacing or velocity).
+    pub fn one_to_one(&self, i: usize, v: &ViewState) -> Option<ViewState> {
+        let p = &self.profiles[i];
+        // Full displayed height: the topography display adds its shift below the section.
+        let topo = if p.proc.depth_datum_m.is_some() { None } else { p.topo_shifts() };
+        let max_shift = topo.map(|t| t.1.iter().fold(0f32, |m, v| m.max(*v)).ceil()).unwrap_or(0.0);
+        let (ntr, ns) = (p.proc.ntr as f32, p.proc.ns as f32 + max_shift);
+        p.one_to_one_traces(ns, self.plot_px).map(|wtr| one_to_one_view(v, wtr, ntr, ns))
+    }
+
+    pub fn set_map_placement(&mut self, m: MapPlacement) {
+        if m == self.settings.map_placement {
+            return;
+        }
+        if m != MapPlacement::Window {
+            self.map_dock = m;
+        }
+        self.settings.map_placement = m;
+        self.map.fitted = false;
+        self.save_settings();
+    }
+
+    /// A save dialog for an export, starting in the default export folder when one is set.
+    pub fn export_dialog(&self) -> rfd::FileDialog {
+        let d = rfd::FileDialog::new();
+        match self.settings.export_dir() {
+            Some(dir) => d.set_directory(dir),
+            None => d,
+        }
     }
 
     pub fn headless(files: Vec<PathBuf>, screenshot: Option<PathBuf>) -> Self {
@@ -203,7 +275,7 @@ impl App {
             clip_cache: HashMap::new(),
             mode: PickMode::Navigate,
             cur_type: 0,
-            snap: Snap::AbsMaximum,
+            snap: Snap::None,
             snap_win: 6,
             auto_track: true,
             marker_types: default_marker_types(),
@@ -218,7 +290,7 @@ impl App {
             basemaps: Vec::new(),
             basemap_jobs: Vec::new(),
             show_map: true,
-            map_detached: false,
+            map_dock: MapPlacement::Right,
             step_editor: None,
             show_marker_table: false,
             show_marker_types: false,
@@ -246,12 +318,18 @@ impl App {
             topo_cache: None,
             topo_shown: HashMap::new(),
             plot_px: [0.0, 0.0],
+            fit_one_to_one: Default::default(),
             show_topo: false,
             saved_snapshot: None,
             remember_projects: true,
+            settings: Default::default(),
+            show_settings: false,
+            collect_confirm: None,
+            collect_report: None,
         };
         if app.screenshot.is_some() {
             app.load_demo(true);
+            app.fit_one_to_one.clear();
             // Test switch for pictures of the topography display.
             if std::env::var("GPRSTUDIO_SHOT_TOPO").is_ok() {
                 app.show_topo = true;
@@ -293,6 +371,7 @@ impl App {
         let id = p.id;
         p.update_coords(&self.project_crs);
         self.views.insert(id, ViewState { tr0: 0.0, tr1: p.proc.ntr as f32, s0: 0.0, s1: p.proc.ns as f32 });
+        self.fit_one_to_one.insert(id);
         self.profiles.push(p);
         self.active = Some(self.profiles.len() - 1);
         id
@@ -528,7 +607,7 @@ impl App {
         let prof_v = self.active_profile().map(|p| p.velocity);
         egui::Window::new(format!("Processing: {}", ed.step.name())).open(&mut open).resizable(false).show(ctx, |ui| {
             if is_depth && ed.step.needs_time_axis() && ed.index.is_none() {
-                ui.colored_label(Color32::from_rgb(180, 90, 0), "Note: the section is already in depth; this step will be skipped unless placed before the time-depth step.");
+                ui.colored_label(crate::draw::warn_color(ui), "Note: the section is already in depth; this step will be skipped unless placed before the time-depth step.");
             }
             egui::Grid::new("params").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 let dv = |ui: &mut egui::Ui, label: &str, v: &mut f32, speed: f64, suffix: &str| {
@@ -682,7 +761,7 @@ impl App {
                 ui.label("Uses measured GPS elevations and horizontal positions. A zero height correction assumes GPS height is antenna height. Output is depth below the highest antenna elevation.");
                 if let Some(p) = self.active_profile() {
                     if let Err(e) = p.topographic_geometry(&self.project_crs, *max_gap_m) {
-                        ui.colored_label(Color32::from_rgb(180, 75, 0), e);
+                        ui.colored_label(crate::draw::warn_color(ui), e);
                     }
                 }
             }
@@ -1052,6 +1131,40 @@ impl App {
         self.show_about = open;
     }
 
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_settings;
+        let mut changed = false;
+        egui::Window::new("Settings").open(&mut open).resizable(false).show(ctx, |ui| {
+            if ui.checkbox(&mut self.settings.dark_mode, "Dark mode").changed() {
+                ctx.set_theme(if self.settings.dark_mode { egui::Theme::Dark } else { egui::Theme::Light });
+                changed = true;
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                let shown = self.settings.export_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_else(|| "not set".into());
+                ui.label(format!("Default export folder: {shown}"));
+                if ui.button("Choose…").clicked() {
+                    if let Some(d) = rfd::FileDialog::new().set_title("Default export folder").pick_folder() {
+                        self.settings.export_dir = Some(d);
+                        changed = true;
+                    }
+                }
+                if ui.add_enabled(self.settings.export_dir.is_some(), egui::Button::new("Reset")).clicked() {
+                    self.settings.export_dir = None;
+                    changed = true;
+                }
+            });
+            if self.settings.export_dir.is_some() && self.settings.export_dir().is_none() {
+                ui.colored_label(crate::draw::warn_color(ui), "This folder no longer exists; export dialogs open where they used to.");
+            }
+            ui.weak("Used as the starting folder of the GeoPackage, PDF, picks CSV and SEG-Y exports.");
+        });
+        if changed {
+            self.save_settings();
+        }
+        self.show_settings = open;
+    }
+
     fn gpkg_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_gpkg;
         let mut go = false;
@@ -1067,14 +1180,14 @@ impl App {
                 ui.label("traces");
             });
             if no_gps > 0 {
-                ui.colored_label(Color32::from_rgb(180, 90, 0), format!("{no_gps} profile(s) have no GPS and are left out of the map layers."));
+                ui.colored_label(crate::draw::warn_color(ui), format!("{no_gps} profile(s) have no GPS and are left out of the map layers."));
             }
             if ui.button(RichText::new("Save .gpkg…").strong()).clicked() {
                 go = true;
             }
         });
         if go {
-            if let Some(path) = rfd::FileDialog::new().add_filter("GeoPackage", &["gpkg"]).set_file_name("gpr_survey.gpkg").save_file() {
+            if let Some(path) = self.export_dialog().add_filter("GeoPackage", &["gpkg"]).set_file_name("gpr_survey.gpkg").save_file() {
                 match self.export_gpkg(&path) {
                     Ok(s) => {
                         self.status = format!("GeoPackage written: {} ({s}).", path.display());
@@ -1187,7 +1300,7 @@ impl App {
             }
         });
         if go {
-            if let Some(path) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).set_file_name("gpr_report.pdf").save_file() {
+            if let Some(path) = self.export_dialog().add_filter("PDF", &["pdf"]).set_file_name("gpr_report.pdf").save_file() {
                 match crate::report::export(self, &path) {
                     Ok(n) => {
                         self.status = format!("PDF written: {} ({n} pages).", path.display());
@@ -1250,6 +1363,13 @@ impl App {
                         ui.close_menu();
                         self.save_project(true);
                     }
+                    if ui.add_enabled(!self.profiles.is_empty(), egui::Button::new("Collect and save project…"))
+                        .on_hover_text("Copy the project and every file it uses into one folder (to zip and share)")
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        self.collect_dialog();
+                    }
                     ui.separator();
                     if ui.button("File header…").clicked() {
                         self.show_header = true;
@@ -1257,6 +1377,11 @@ impl App {
                     }
                     if ui.button("Supported files…").clicked() {
                         self.show_about = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Settings…").clicked() {
+                        self.show_settings = true;
                         ui.close_menu();
                     }
                     ui.separator();
@@ -1296,7 +1421,12 @@ impl App {
                 });
                 ui.menu_button("Map", |ui| {
                     ui.checkbox(&mut self.show_map, "Show GPS map");
-                    ui.checkbox(&mut self.map_detached, "Map in its own window");
+                    for (m, n) in [(MapPlacement::Right, "Map on the right"), (MapPlacement::Bottom, "Map at the bottom"), (MapPlacement::Window, "Map in its own window")] {
+                        if ui.radio(self.settings.map_placement == m, n).clicked() {
+                            self.set_map_placement(m);
+                            ui.close_menu();
+                        }
+                    }
                     if ui.button("Add GeoTIFF basemap…").clicked() {
                         ui.close_menu();
                         if let Some(fs) = rfd::FileDialog::new().add_filter("GeoTIFF", &["tif", "tiff", "TIF", "TIFF"]).pick_files() {
@@ -1329,7 +1459,7 @@ impl App {
                     }
                     if ui.button("Picks as CSV…").clicked() {
                         ui.close_menu();
-                        if let Some(f) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("picks.csv").save_file() {
+                        if let Some(f) = self.export_dialog().add_filter("CSV", &["csv"]).set_file_name("picks.csv").save_file() {
                             match self.export_csv(&f) {
                                 Ok(n) => self.status = format!("{n} picks written to {}", f.display()),
                                 Err(e) => self.status = e,
@@ -1475,19 +1605,14 @@ impl App {
                     self.status = format!("Oriented {oriented} profile(s) from GPS; profiles without a clear direction were skipped.");
                 }
                 if ui.add_enabled(self.active_profile().is_some(), egui::Button::new("1x1 ratio"))
-                    .on_hover_text("Same metres per pixel horizontally and vertically (time sections use the toolbar velocity)")
+                    .on_hover_text("Whole section height, with the same metres per pixel horizontally (time sections use the toolbar velocity)")
                     .clicked()
                 {
-                    let plot = self.plot_px;
-                    if let Some(p) = self.active_profile() {
-                        let (id, ntr, ns) = (p.id, p.proc.ntr as f32, p.proc.ns as f32);
-                        let mut v = self.views.get(&id).cloned().unwrap_or(ViewState { tr0: 0.0, tr1: ntr, s0: 0.0, s1: ns });
-                        if let Some(ws) = p.one_to_one_samples(v.tr1 - v.tr0, plot) {
-                            // Too tall for the section: keep the full height and narrow the trace span instead.
-                            let (wtr, ws) = if ws > ns { ((v.tr1 - v.tr0) * ns / ws, ns) } else { (v.tr1 - v.tr0, ws) };
-                            let c = (v.tr0 + v.tr1) / 2.0;
-                            v = ViewState { tr0: c - wtr / 2.0, tr1: c + wtr / 2.0, s0: v.s0, s1: v.s0 + ws };
-                            self.views.insert(id, v);
+                    if let Some(a) = self.active {
+                        let id = self.profiles[a].id;
+                        let v = self.views.get(&id).cloned();
+                        if let Some(view) = v.and_then(|v| self.one_to_one(a, &v)) {
+                            self.views.insert(id, view);
                         } else {
                             self.status = "1x1 ratio needs a known trace spacing, velocity and a visible profile.".into();
                         }
@@ -1656,7 +1781,7 @@ impl App {
                 });
                 if let Some(a) = self.active {
                     for l in &self.profiles[a].log {
-                        ui.colored_label(Color32::from_rgb(170, 80, 0), l);
+                        ui.colored_label(crate::draw::warn_color(ui), l);
                     }
                 }
             }
@@ -1809,7 +1934,7 @@ impl App {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let label = if self.project_path.is_some() { "  Save  " } else { "  Save…  " };
-                if ui.add(egui::Button::new(RichText::new(label).strong()).fill(Color32::from_rgb(200, 225, 255))).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if ui.add(egui::Button::new(RichText::new(label).strong()).fill(ui.visuals().selection.bg_fill)).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     choice = 1;
                 }
                 if ui.button("Don't save").clicked() {
@@ -1866,10 +1991,35 @@ impl App {
     }
 }
 
+/// 1x1 view: the whole height, `wtr` traces around the current centre, kept inside the profile
+/// (a span wider than the profile starts at trace 0; the data view then draws it narrower).
+fn one_to_one_view(v: &ViewState, wtr: f32, ntr: f32, ns: f32) -> ViewState {
+    let c = ((v.tr0 + v.tr1) / 2.0).clamp(wtr / 2.0, (ntr - wtr / 2.0).max(wtr / 2.0));
+    let tr0 = if wtr >= ntr { 0.0 } else { c - wtr / 2.0 };
+    ViewState { tr0, tr1: tr0 + wtr, s0: 0.0, s1: ns }
+}
+
+#[cfg(test)]
+mod one_to_one_tests {
+    use super::*;
+
+    #[test]
+    fn keeps_full_height_and_centre_inside_profile() {
+        let v = ViewState { tr0: 100.0, tr1: 200.0, s0: 30.0, s1: 60.0 };
+        let r = one_to_one_view(&v, 40.0, 1000.0, 512.0);
+        assert_eq!((r.tr0, r.tr1, r.s0, r.s1), (130.0, 170.0, 0.0, 512.0));
+        let r = one_to_one_view(&ViewState { tr0: 950.0, tr1: 1000.0, ..v.clone() }, 200.0, 1000.0, 512.0);
+        assert_eq!((r.tr0, r.tr1), (800.0, 1000.0)); // shifted back inside
+        let r = one_to_one_view(&v, 3000.0, 1000.0, 512.0);
+        assert_eq!((r.tr0, r.tr1), (0.0, 3000.0)); // short profile: wider span, drawn narrower
+    }
+}
+
 fn spectrum_plot(ui: &mut egui::Ui, spec: &[(f32, f32)], step: &Step) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(380.0, 130.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 2.0, Color32::from_gray(250));
+    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+    let text = ui.visuals().weak_text_color();
     let amax = spec.iter().map(|s| s.1).fold(0.0, f32::max).max(1e-20);
     let fmax = spec.iter().rev().find(|(_, a)| *a > amax * 0.01).map(|s| s.0 * 1.3).unwrap_or(1000.0).max(50.0);
     let pts: Vec<egui::Pos2> = spec.iter().filter(|(f, _)| *f <= fmax).map(|(f, a)| egui::pos2(rect.left() + f / fmax * rect.width(), rect.bottom() - a / amax * (rect.height() - 14.0))).collect();
@@ -1890,8 +2040,8 @@ fn spectrum_plot(ui: &mut egui::Ui, spec: &[(f32, f32)], step: &Step) {
         fp.push(egui::pos2(rect.left() + f / fmax * rect.width(), rect.bottom() - w * (rect.height() - 14.0)));
     }
     painter.add(egui::Shape::line(fp, egui::Stroke::new(1.5, Color32::from_rgb(220, 60, 30))));
-    painter.text(rect.left_top() + egui::vec2(4.0, 2.0), egui::Align2::LEFT_TOP, "spectrum (blue), filter (red)", egui::FontId::proportional(11.0), Color32::DARK_GRAY);
-    painter.text(rect.right_bottom() - egui::vec2(4.0, 2.0), egui::Align2::RIGHT_BOTTOM, format!("{fmax:.0} MHz"), egui::FontId::proportional(11.0), Color32::DARK_GRAY);
+    painter.text(rect.left_top() + egui::vec2(4.0, 2.0), egui::Align2::LEFT_TOP, "spectrum (blue), filter (red)", egui::FontId::proportional(11.0), text);
+    painter.text(rect.right_bottom() - egui::vec2(4.0, 2.0), egui::Align2::RIGHT_BOTTOM, format!("{fmax:.0} MHz"), egui::FontId::proportional(11.0), text);
 }
 
 impl eframe::App for App {
@@ -1910,20 +2060,27 @@ impl eframe::App for App {
         self.status_bar(ctx);
         self.left_panel(ctx);
         if self.show_map {
-            if self.map_detached {
-                let vid = egui::ViewportId::from_hash_of("map_window");
-                let mut close = false;
-                ctx.show_viewport_immediate(vid, egui::ViewportBuilder::default().with_title("GPS tracks and map").with_inner_size([700.0, 600.0]), |ctx, _class| {
-                    egui::CentralPanel::default().show(ctx, |ui| self.map_ui(ui));
-                    if ctx.input(|i| i.viewport().close_requested()) {
-                        close = true;
+            match self.settings.map_placement {
+                MapPlacement::Window => {
+                    let vid = egui::ViewportId::from_hash_of("map_window");
+                    let mut close = false;
+                    ctx.show_viewport_immediate(vid, egui::ViewportBuilder::default().with_title("GPS tracks and map").with_inner_size([700.0, 600.0]), |ctx, _class| {
+                        egui::CentralPanel::default().show(ctx, |ui| self.map_ui(ui));
+                        if ctx.input(|i| i.viewport().close_requested()) {
+                            close = true;
+                        }
+                    });
+                    if close {
+                        self.set_map_placement(self.map_dock);
                     }
-                });
-                if close {
-                    self.map_detached = false;
                 }
-            } else {
-                egui::SidePanel::right("map").resizable(true).default_width(470.0).min_width(260.0).show(ctx, |ui| self.map_ui(ui));
+                MapPlacement::Bottom => {
+                    let h = ctx.screen_rect().height();
+                    egui::TopBottomPanel::bottom("map_bottom").resizable(true).default_height(h * 0.35).min_height(160.0).show(ctx, |ui| self.map_ui(ui));
+                }
+                MapPlacement::Right => {
+                    egui::SidePanel::right("map").resizable(true).default_width(470.0).min_width(260.0).show(ctx, |ui| self.map_ui(ui));
+                }
             }
         }
         egui::CentralPanel::default().show(ctx, |ui| self.dataview_ui(ui));
@@ -1938,6 +2095,8 @@ impl eframe::App for App {
         self.gpkg_window(ctx);
         self.pdf_window(ctx);
         self.segy_window(ctx);
+        self.settings_window(ctx);
+        self.collect_windows(ctx);
         self.task_popup_ui(ctx);
         self.close_question_ui(ctx);
         self.handle_screenshot(ctx);

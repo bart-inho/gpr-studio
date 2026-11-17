@@ -67,9 +67,11 @@ impl App {
             if ui.small_button(self.project_crs.short()).on_hover_text(format!("{}\nClick to change the output coordinate system", self.project_crs.label())).clicked() {
                 self.show_crs = true;
             }
-            let label = if self.map_detached { "Dock" } else { "Own window" };
-            if ui.small_button(label).clicked() {
-                self.map_detached = !self.map_detached;
+            use crate::app::MapPlacement;
+            for (m, label) in [(MapPlacement::Window, "Own window"), (MapPlacement::Bottom, "Bottom"), (MapPlacement::Right, "Right")] {
+                if ui.selectable_label(self.settings.map_placement == m, label).clicked() {
+                    self.set_map_placement(m);
+                }
             }
         });
         if !self.basemaps.is_empty() {
@@ -138,7 +140,10 @@ impl App {
         let to_w = |p: Pos2| [cx + (p.x - rect.center().x) as f64 * sc, cy - (p.y - rect.center().y) as f64 * sc];
 
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(236, 238, 232));
+        let dark = ui.visuals().dark_mode;
+        // Texts drawn straight on the map background follow the theme.
+        let (map_bg, text, weak) = if dark { (Color32::from_rgb(40, 42, 38), Color32::from_gray(230), Color32::from_gray(190)) } else { (Color32::from_rgb(236, 238, 232), Color32::BLACK, Color32::from_gray(60)) };
+        painter.rect_filled(rect, 0.0, map_bg);
 
         // ---------------------------------------------------------- basemaps
         let project = self.project_crs.clone();
@@ -310,7 +315,7 @@ impl App {
                 let at = to_s(c[0], c[1]);
                 if rect.expand(10.0).contains(at) {
                     draw::symbol(&painter, at, 5.0, t.symbol, c32(t.color), self.selected_pick == Some(m.id));
-                    painter.text(at + egui::vec2(7.0, 4.0), Align2::LEFT_TOP, format!("#{}", m.id), FontId::proportional(10.0), Color32::BLACK);
+                    painter.text(at + egui::vec2(7.0, 4.0), Align2::LEFT_TOP, format!("#{}", m.id), FontId::proportional(10.0), text);
                 }
             }
         }
@@ -330,7 +335,7 @@ impl App {
                 if let Some(c) = p.coord_at(tr) {
                     let at = to_s(c[0], c[1]);
                     painter.circle_stroke(at, 7.0, Stroke::new(2.0, Color32::from_rgb(230, 30, 30)));
-                    painter.text(at + egui::vec2(10.0, 8.0), Align2::LEFT_TOP, format!("{}  trace {:.0}  {:.1} m", p.name, tr + 1.0, p.dist_at(tr)), FontId::proportional(11.0), Color32::BLACK);
+                    painter.text(at + egui::vec2(10.0, 8.0), Align2::LEFT_TOP, format!("{}  trace {:.0}  {:.1} m", p.name, tr + 1.0, p.dist_at(tr)), FontId::proportional(11.0), text);
                 }
             }
             if resp.clicked() {
@@ -341,7 +346,7 @@ impl App {
 
         // ---------------------------------------------------------- decorations
         if self.profiles.iter().all(|p| !p.has_coords()) && self.basemaps.is_empty() {
-            painter.text(rect.center(), Align2::CENTER_CENTER, "No GPS tracks yet.\nImport profiles with GPS, or add a GeoTIFF basemap.", FontId::proportional(13.0), Color32::DARK_GRAY);
+            painter.text(rect.center(), Align2::CENTER_CENTER, "No GPS tracks yet.\nImport profiles with GPS, or add a GeoTIFF basemap.", FontId::proportional(13.0), weak);
         }
         // Scale bar
         let geo = self.is_geographic();
@@ -357,19 +362,19 @@ impl App {
         painter.text(b0 + egui::vec2(bar_px + 4.0, -2.0), Align2::LEFT_CENTER, lbl, FontId::proportional(11.0), Color32::BLACK);
         // North arrow
         let na = Pos2::new(rect.right() - 22.0, rect.top() + 30.0);
-        painter.add(egui::Shape::convex_polygon(vec![na + egui::vec2(0.0, -16.0), na + egui::vec2(7.0, 6.0), na, na + egui::vec2(-7.0, 6.0)], Color32::BLACK, Stroke::new(1.0, Color32::BLACK)));
-        painter.text(na + egui::vec2(0.0, 8.0), Align2::CENTER_TOP, "N", FontId::proportional(12.0), Color32::BLACK);
+        painter.add(egui::Shape::convex_polygon(vec![na + egui::vec2(0.0, -16.0), na + egui::vec2(7.0, 6.0), na, na + egui::vec2(-7.0, 6.0)], text, Stroke::new(1.0, text)));
+        painter.text(na + egui::vec2(0.0, 8.0), Align2::CENTER_TOP, "N", FontId::proportional(12.0), text);
         // CRS and coordinates
-        painter.text(rect.left_top() + egui::vec2(6.0, 4.0), Align2::LEFT_TOP, self.project_crs.label(), FontId::proportional(11.0), Color32::from_gray(60));
+        painter.text(rect.left_top() + egui::vec2(6.0, 4.0), Align2::LEFT_TOP, self.project_crs.label(), FontId::proportional(11.0), weak);
         if let Some(w) = self.map.hover_world {
             let s = if geo { format!("{:.6}°, {:.6}°", w[1], w[0]) } else { format!("E {:.2}  N {:.2}", w[0], w[1]) };
-            painter.text(rect.right_bottom() - egui::vec2(6.0, 4.0), Align2::RIGHT_BOTTOM, s, FontId::monospace(11.0), Color32::BLACK);
+            painter.text(rect.right_bottom() - egui::vec2(6.0, 4.0), Align2::RIGHT_BOTTOM, s, FontId::monospace(11.0), text);
         }
         // Legend for the highlight
         if active_id.is_some() {
             let lp = rect.left_top() + egui::vec2(6.0, 20.0);
             painter.line_segment([lp + egui::vec2(0.0, 6.0), lp + egui::vec2(22.0, 6.0)], Stroke::new(7.0, SECTION_COLOR));
-            painter.text(lp + egui::vec2(28.0, 6.0), Align2::LEFT_CENTER, "section shown in the data view", FontId::proportional(10.5), Color32::from_gray(50));
+            painter.text(lp + egui::vec2(28.0, 6.0), Align2::LEFT_CENTER, "section shown in the data view", FontId::proportional(10.5), weak);
         }
     }
 }
