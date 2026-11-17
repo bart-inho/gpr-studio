@@ -247,7 +247,7 @@ impl App {
             let pts: Vec<Pos2> = p.coords.iter().step_by(step).chain(std::iter::once(&p.coords[n - 1])).map(|c| to_s(c[0], c[1])).collect();
             let is_active = Some(p.id) == active_id;
             if is_active {
-                painter.add(egui::Shape::line(pts.clone(), Stroke::new(4.5, Color32::WHITE)));
+                painter.add(egui::Shape::line(pts.clone(), Stroke::new(4.5_f32, Color32::WHITE)));
                 // Visible section of the data view
                 if let Some(v) = self.views.get(&p.id) {
                     let a = v.tr0.max(0.0) as usize;
@@ -255,17 +255,17 @@ impl App {
                     if b > a + 1 {
                         let st = ((b - a) / 2000).max(1);
                         let sp: Vec<Pos2> = p.coords[a..b].iter().step_by(st).chain(std::iter::once(&p.coords[b - 1])).map(|c| to_s(c[0], c[1])).collect();
-                        painter.add(egui::Shape::line(sp.clone(), Stroke::new(9.0, SECTION_COLOR)));
+                        painter.add(egui::Shape::line(sp.clone(), Stroke::new(9.0_f32, SECTION_COLOR)));
                         for e in [sp[0], *sp.last().unwrap()] {
                             painter.circle_filled(e, 5.0, SECTION_COLOR);
-                            painter.circle_stroke(e, 5.0, Stroke::new(1.0, Color32::BLACK));
+                            painter.circle_stroke(e, 5.0, Stroke::new(1.0_f32, Color32::BLACK));
                         }
                     }
                 }
-                painter.add(egui::Shape::line(pts.clone(), Stroke::new(2.5, ACTIVE_COLOR)));
+                painter.add(egui::Shape::line(pts.clone(), Stroke::new(2.5_f32, ACTIVE_COLOR)));
             } else {
-                painter.add(egui::Shape::line(pts.clone(), Stroke::new(3.5, Color32::WHITE)));
-                painter.add(egui::Shape::line(pts.clone(), Stroke::new(1.8, Color32::from_rgb(70, 70, 70))));
+                painter.add(egui::Shape::line(pts.clone(), Stroke::new(3.5_f32, Color32::WHITE)));
+                painter.add(egui::Shape::line(pts.clone(), Stroke::new(1.8_f32, Color32::from_rgb(70, 70, 70))));
             }
             // Start marker, direction and label
             let s = pts[0];
@@ -305,7 +305,7 @@ impl App {
                 continue;
             }
             let pts: Vec<Pos2> = l.points.iter().filter_map(|(tr, _)| p.coord_at(*tr)).map(|c| to_s(c[0], c[1])).collect();
-            painter.add(egui::Shape::dashed_line(&pts, Stroke::new(3.0, c32(t.color)), 6.0, 3.0));
+            painter.add(egui::Shape::dashed_line(&pts, Stroke::new(3.0_f32, c32(t.color)), 6.0, 3.0));
         }
         // Markers
         for m in &self.markers {
@@ -324,7 +324,7 @@ impl App {
             if let Some(c) = p.coord_at(tr) {
                 let at = to_s(c[0], c[1]);
                 painter.circle_filled(at, 5.5, Color32::from_rgb(230, 30, 30));
-                painter.circle_stroke(at, 5.5, Stroke::new(1.5, Color32::WHITE));
+                painter.circle_stroke(at, 5.5, Stroke::new(1.5_f32, Color32::WHITE));
             }
         }
         // Hover on the map
@@ -334,7 +334,7 @@ impl App {
             if let Some(p) = self.profiles.iter().find(|p| p.id == pid) {
                 if let Some(c) = p.coord_at(tr) {
                     let at = to_s(c[0], c[1]);
-                    painter.circle_stroke(at, 7.0, Stroke::new(2.0, Color32::from_rgb(230, 30, 30)));
+                    painter.circle_stroke(at, 7.0, Stroke::new(2.0_f32, Color32::from_rgb(230, 30, 30)));
                     painter.text(at + egui::vec2(10.0, 8.0), Align2::LEFT_TOP, format!("{}  trace {:.0}  {:.1} m", p.name, tr + 1.0, p.dist_at(tr)), FontId::proportional(11.0), text);
                 }
             }
@@ -357,12 +357,12 @@ impl App {
         let b0 = Pos2::new(rect.left() + 14.0, rect.bottom() - 16.0);
         painter.rect_filled(Rect::from_min_max(b0 + egui::vec2(-6.0, -20.0), b0 + egui::vec2(bar_px + 40.0, 8.0)), 3.0, Color32::from_rgba_unmultiplied(255, 255, 255, 200));
         painter.rect_filled(Rect::from_min_max(b0 + egui::vec2(0.0, -4.0), b0 + egui::vec2(bar_px / 2.0, 0.0)), 0.0, Color32::BLACK);
-        painter.rect_stroke(Rect::from_min_max(b0 + egui::vec2(0.0, -4.0), b0 + egui::vec2(bar_px, 0.0)), 0.0, Stroke::new(1.0, Color32::BLACK), egui::StrokeKind::Middle);
+        painter.rect_stroke(Rect::from_min_max(b0 + egui::vec2(0.0, -4.0), b0 + egui::vec2(bar_px, 0.0)), 0.0, Stroke::new(1.0_f32, Color32::BLACK), egui::StrokeKind::Middle);
         let lbl = if bar_m >= 1000.0 { format!("{:.0} km", bar_m / 1000.0) } else if bar_m >= 1.0 { format!("{bar_m:.0} m") } else { format!("{bar_m:.2} m") };
         painter.text(b0 + egui::vec2(bar_px + 4.0, -2.0), Align2::LEFT_CENTER, lbl, FontId::proportional(11.0), Color32::BLACK);
         // North arrow
         let na = Pos2::new(rect.right() - 22.0, rect.top() + 30.0);
-        painter.add(egui::Shape::convex_polygon(vec![na + egui::vec2(0.0, -16.0), na + egui::vec2(7.0, 6.0), na, na + egui::vec2(-7.0, 6.0)], text, Stroke::new(1.0, text)));
+        painter.add(egui::Shape::convex_polygon(vec![na + egui::vec2(0.0, -16.0), na + egui::vec2(7.0, 6.0), na, na + egui::vec2(-7.0, 6.0)], text, Stroke::new(1.0_f32, text)));
         painter.text(na + egui::vec2(0.0, 8.0), Align2::CENTER_TOP, "N", FontId::proportional(12.0), text);
         // CRS and coordinates
         painter.text(rect.left_top() + egui::vec2(6.0, 4.0), Align2::LEFT_TOP, self.project_crs.label(), FontId::proportional(11.0), weak);
@@ -373,7 +373,7 @@ impl App {
         // Legend for the highlight
         if active_id.is_some() {
             let lp = rect.left_top() + egui::vec2(6.0, 20.0);
-            painter.line_segment([lp + egui::vec2(0.0, 6.0), lp + egui::vec2(22.0, 6.0)], Stroke::new(7.0, SECTION_COLOR));
+            painter.line_segment([lp + egui::vec2(0.0, 6.0), lp + egui::vec2(22.0, 6.0)], Stroke::new(7.0_f32, SECTION_COLOR));
             painter.text(lp + egui::vec2(28.0, 6.0), Align2::LEFT_CENTER, "section shown in the data view", FontId::proportional(10.5), weak);
         }
     }

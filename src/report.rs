@@ -63,6 +63,34 @@ fn label(pg: &mut Page, x: f32, y: f32, size: f32, text: &str, bold: bool, col: 
     pg.text(x, y, size, text, bold);
 }
 
+fn fit_text(text: &str, size: f32, width: f32) -> String {
+    if crate::pdf::text_width(text, size) <= width { return text.to_string(); }
+    let mut out = String::new();
+    for c in text.chars() {
+        let next = format!("{out}{c}...");
+        if crate::pdf::text_width(&next, size) > width { break; }
+        out.push(c);
+    }
+    out.push_str("...");
+    out
+}
+
+fn wrap_text(text: &str, size: f32, width: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let next = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+        if !line.is_empty() && crate::pdf::text_width(&next, size) > width {
+            lines.push(line);
+            line = word.to_string();
+        } else {
+            line = next;
+        }
+    }
+    if !line.is_empty() { lines.push(line); }
+    lines.into_iter().map(|s| fit_text(&s, size, width)).collect()
+}
+
 struct MapLabel {
     x: f32,
     y: f32,
@@ -146,8 +174,9 @@ fn page_geometry(a3: bool) -> (f32, f32, f32, f32, f32, f32, f32) {
     let gx = m + 34.0 * k;
     let gy = 56.0 * k;
     let gw = pw - gx - m - 40.0 * k;
-    let map_h = ph * 0.25;
-    let gh = ph - gy - 32.0 * k - map_h - m - 4.0;
+    let bottom_y = ph * 0.75;
+    let map_h = ph - (bottom_y + 18.0 * k) - 8.0 * k;
+    let gh = bottom_y - gy - 32.0 * k;
     (pw, ph, gx, gy, gw, gh, map_h)
 }
 
@@ -174,6 +203,33 @@ fn vertical_range(app: &App, p: &Profile) -> (f32, f32) {
 #[cfg(test)]
 mod report_layout_tests {
     use super::*;
+
+    #[test]
+    fn fixed_page_regions_and_wrapped_processing_fit_their_columns() {
+        let (pw, ph, _, gy, _, gh, map_h) = page_geometry(false);
+        let bottom_y = ph * 0.75;
+        assert!((gy + gh + 32.0 - bottom_y).abs() < 0.01);
+        assert!((bottom_y + 18.0 + map_h + 8.0 - ph).abs() < 0.01);
+        let gap = 12.0;
+        let col_w = (pw - 52.0 - 2.0 * gap) / 3.0;
+        assert!((26.0 + col_w * 3.0 + gap * 2.0 + 26.0 - pw).abs() < 0.01);
+        let lines = wrap_text("1. Topographic Kirchhoff - v=0.100 m/ns and other settings", 6.5, 100.0);
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|line| crate::pdf::text_width(line, 6.5) <= 100.0));
+    }
+
+    #[test]
+    fn long_processing_sequence_stays_in_its_column() {
+        let mut app = App::headless(vec![], None);
+        let mut profile = crate::demo::make().remove(0);
+        profile.steps = (0..12).map(|_| crate::processing::StepEntry {
+            enabled: true,
+            step: Step::RunningAverage { traces: 4, t_start: 0.0, t_end: 1e9 },
+        }).collect();
+        app.add_profile(profile);
+        let path = std::path::Path::new("target/report-processing-layout.pdf");
+        assert_eq!(export(&app, path).unwrap(), 1);
+    }
 
     #[test]
     fn crowded_map_keeps_the_lower_number() {
@@ -520,9 +576,11 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
         }
 
         // ---------------------------------------------------------- map
-        let my = gy + gh + 32.0 * k;
+        let bottom_y = ph * 0.75;
+        let my = bottom_y + 18.0 * k;
         let mh = map_h;
-        let mw = (pw - 2.0 * m) * 0.54;
+        let gap = 12.0 * k;
+        let mw = (pw - 2.0 * m - 2.0 * gap) / 3.0;
         let mx = m;
         pg.stroke_color([0, 0, 0]);
         pg.line_width(0.8);
@@ -663,6 +721,9 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
             // Scale bar
             pg.fill_color([0, 0, 0]);
             pg.rect(bx, by - 3.0, bar_pt / 2.0, 3.0, true, false);
+            pg.fill_color([255, 255, 255]);
+            pg.rect(bx + bar_pt / 2.0, by - 3.0, bar_pt / 2.0, 3.0, true, false);
+            pg.stroke_color([0, 0, 0]);
             pg.rect(bx, by - 3.0, bar_pt, 3.0, false, true);
             pg.text_halo(bx + bar_pt + 4.0, by, 7.0 * k, &if bar_m >= 1.0 { format!("{bar_m:.0} m") } else { format!("{bar_m:.2} m") }, false, [0, 0, 0]);
             // North arrow
@@ -678,14 +739,17 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
         }
 
         // ---------------------------------------------------------- info block
-        let ix = mx + mw + 16.0 * k;
-        let iw = pw - m - ix;
-        let mut iy = my + 6.0;
-        let lh = 9.6 * k;
-        let ifs = 7.4 * k;
+        let ix = mx + mw + gap;
+        let iw = mw;
+        let px = ix + iw + gap;
+        let limit_y = ph - 8.0 * k;
+        let lh = 8.6 * k;
+        let ifs = 6.5 * k;
+        let mut iy = bottom_y + 21.0 * k;
+        pg.save();
+        pg.clip_rect(ix, bottom_y, iw, limit_y - bottom_y);
         pg.fill_color([30, 50, 80]);
-        pg.text(ix, iy, 9.0 * k, "Profile", true);
-        iy += lh * 1.2;
+        pg.text(ix, bottom_y + 10.0 * k, 9.0 * k, "Profile", true);
         let sec_a = p.coord_at(tr0);
         let sec_b = p.coord_at((tr1 - 1.0).max(tr0));
         let mut rows: Vec<(&str, String)> = vec![
@@ -707,74 +771,69 @@ pub fn export(app: &App, path: &std::path::Path) -> Result<usize, String> {
         }
         for (k2, v2) in rows {
             pg.fill_color([90, 90, 90]);
-            pg.text(ix, iy, ifs, k2, false);
+            pg.text(ix, iy, ifs, &fit_text(k2, ifs, 71.0 * k), false);
             pg.fill_color([0, 0, 0]);
-            pg.text(ix + 78.0 * k, iy, ifs, &v2, false);
+            pg.text(ix + 74.0 * k, iy, ifs, &fit_text(&v2, ifs, iw - 76.0 * k), false);
             iy += lh;
         }
+        pg.restore();
+        // Processing and picks have their own fixed-width column.
         if app.pdf_opts.processing {
-            iy += lh * 0.4;
+            let mut py = bottom_y + 21.0 * k;
+            pg.save();
+            pg.clip_rect(px, bottom_y, iw, limit_y - bottom_y);
             pg.fill_color([30, 50, 80]);
-            pg.text(ix, iy, 9.0 * k, "Processing", true);
-            iy += lh * 1.1;
+            pg.text(px, bottom_y + 10.0 * k, 9.0 * k, "Processing", true);
             let steps: Vec<_> = p.steps.iter().filter(|e| e.enabled).collect();
             if steps.is_empty() {
                 pg.fill_color([0, 0, 0]);
-                pg.text(ix, iy, ifs, "raw data", false);
-                iy += lh;
+                pg.text(px, py, ifs, "raw data", false);
+                py += lh;
             }
             for (n, e) in steps.iter().enumerate() {
-                if iy > ph - m - lh * 6.0 {
-                    break;
-                }
-                pg.fill_color([0, 0, 0]);
                 let summary = match &e.step {
                     Step::TopographicKirchhoff { velocity, .. } => format!("v={velocity:.3} m/ns"),
                     _ => e.step.summary(),
                 };
-                pg.text(ix, iy, ifs, &format!("{}. {} - {}", n + 1, e.step.name(), summary), false);
-                iy += lh;
+                let lines = wrap_text(&format!("{}. {} - {}", n + 1, e.step.name(), summary), ifs, iw - 3.0 * k);
+                let needed = lines.len() + usize::from(n + 1 < steps.len());
+                if py + (needed.saturating_sub(1) as f32) * lh > limit_y {
+                    if py <= limit_y {
+                        pg.fill_color([90, 90, 90]);
+                        pg.text(px, py, ifs, &format!("+ {} more steps", steps.len() - n), false);
+                    }
+                    break;
+                }
+                pg.fill_color([0, 0, 0]);
+                for line in lines {
+                    pg.text(px, py, ifs, &line, false);
+                    py += lh;
+                }
             }
             // Picks in this section
             let picks: Vec<_> = app.markers.iter().filter(|mk| mk.profile_id == p.id && mk.trace >= tr0 && mk.trace <= tr1).collect();
-            if !picks.is_empty() && iy < ph - m - lh * 3.0 {
-                iy += lh * 0.4;
+            if !picks.is_empty() && py + 2.0 * lh <= limit_y {
+                py += lh * 0.3;
                 pg.fill_color([30, 50, 80]);
-                pg.text(ix, iy, 9.0 * k, "Markers in this section", true);
-                iy += lh * 1.1;
-                let cols = [0.0, 18.0, 92.0, 128.0, 160.0, 210.0];
-                pg.fill_color([90, 90, 90]);
-                for (c, h) in cols.iter().zip(["#", "type", "dist m", "depth m", "E", "N"]) {
-                    pg.text(ix + c * k, iy, ifs, h, true);
-                }
-                iy += lh;
+                pg.text(px, py, 8.0 * k, &format!("Markers in this section ({})", picks.len()), true);
+                py += lh;
                 for mk in picks {
-                    if iy > ph - m - 2.0 {
+                    if py > limit_y {
                         break;
                     }
                     let t = app.marker_types.get(mk.type_idx);
                     let depth = mk.velocity.unwrap_or(p.velocity) * mk.time_ns / 2.0;
                     let c = p.coord_at(mk.trace);
-                    if let Some(t) = t {
-                        pdf_symbol(&mut pg, ix + 92.0 * k - 6.0, iy - 2.5, 2.3, t.symbol, t.color);
-                    }
                     pg.fill_color([0, 0, 0]);
-                    let vals = [
-                        mk.id.to_string(),
-                        t.map(|t| t.name.chars().take(16).collect::<String>()).unwrap_or_default(),
-                        format!("{:.2}", p.dist_at(mk.trace)),
-                        format!("{depth:.2}"),
-                        c.map(|c| format!("{:.2}", c[0])).unwrap_or("-".into()),
-                        c.map(|c| format!("{:.2}", c[1])).unwrap_or("-".into()),
-                    ];
-                    for (cx2, v2) in cols.iter().zip(vals.iter()) {
-                        pg.text(ix + cx2 * k, iy, ifs, v2, false);
-                    }
-                    iy += lh;
+                    let text = format!("#{} {}  d {:.2} m  z {depth:.2} m  {}", mk.id,
+                        t.map(|t| t.name.as_str()).unwrap_or(""), p.dist_at(mk.trace),
+                        c.map(|c| format!("E {:.1} N {:.1}", c[0], c[1])).unwrap_or_default());
+                    pg.text(px, py, ifs, &fit_text(&text, ifs, iw - 3.0 * k), false);
+                    py += lh;
                 }
             }
+            pg.restore();
         }
-        let _ = iw;
         // Legend under the map title line
         if p.coords.is_empty() {
             pg.text(mx, my - 11.5 * k, 7.0 * k, "This profile has no GPS track", false);

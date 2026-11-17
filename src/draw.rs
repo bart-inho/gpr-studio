@@ -8,7 +8,7 @@ pub fn c32(c: [u8; 3]) -> Color32 {
 }
 
 pub fn symbol(p: &Painter, at: Pos2, r: f32, sym: Symbol, color: Color32, selected: bool) {
-    let outline = Stroke::new(1.2, Color32::BLACK);
+    let outline = Stroke::new(1.2_f32, Color32::BLACK);
     match sym {
         Symbol::Circle => {
             p.circle_filled(at, r, color);
@@ -28,10 +28,10 @@ pub fn symbol(p: &Painter, at: Pos2, r: f32, sym: Symbol, color: Color32, select
             p.add(Shape::convex_polygon(pts, color, outline));
         }
         Symbol::Cross => {
-            let s = Stroke::new(3.5, Color32::BLACK);
+            let s = Stroke::new(3.5_f32, Color32::BLACK);
             p.line_segment([at + egui::vec2(-r, -r), at + egui::vec2(r, r)], s);
             p.line_segment([at + egui::vec2(-r, r), at + egui::vec2(r, -r)], s);
-            let s = Stroke::new(2.0, color);
+            let s = Stroke::new(2.0_f32, color);
             p.line_segment([at + egui::vec2(-r, -r), at + egui::vec2(r, r)], s);
             p.line_segment([at + egui::vec2(-r, r), at + egui::vec2(r, -r)], s);
         }
@@ -58,8 +58,8 @@ pub fn symbol(p: &Painter, at: Pos2, r: f32, sym: Symbol, color: Color32, select
         }
     }
     if selected {
-        p.circle_stroke(at, r + 4.0, Stroke::new(2.0, Color32::from_rgb(255, 255, 0)));
-        p.circle_stroke(at, r + 6.0, Stroke::new(1.0, Color32::BLACK));
+        p.circle_stroke(at, r + 4.0, Stroke::new(2.0_f32, Color32::from_rgb(255, 255, 0)));
+        p.circle_stroke(at, r + 6.0, Stroke::new(1.0_f32, Color32::BLACK));
     }
 }
 

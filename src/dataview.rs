@@ -356,7 +356,7 @@ impl App {
                 let y = y_px_of_val(v as f32, is_depth);
                 if y >= plot.top() - 0.5 && y <= plot.bottom() + 0.5 {
                     let dx = if at_left { -5.0 } else { 5.0 };
-                    painter.line_segment([Pos2::new(x, y), Pos2::new(x + dx, y)], Stroke::new(1.0, axis_col));
+                    painter.line_segment([Pos2::new(x, y), Pos2::new(x + dx, y)], Stroke::new(1.0_f32, axis_col));
                     painter.text(Pos2::new(x + dx * 1.4, y), if at_left { Align2::RIGHT_CENTER } else { Align2::LEFT_CENTER }, fmt_tick(v, step), font.clone(), axis_col);
                 }
                 v += step;
@@ -377,7 +377,7 @@ impl App {
             while e <= eb + 1e-9 {
                 let y = y_px_of_val((zm - e) as f32, true);
                 if y >= plot.top() - 0.5 && y <= plot.bottom() + 0.5 {
-                    painter.line_segment([Pos2::new(plot.right(), y), Pos2::new(plot.right() + 5.0, y)], Stroke::new(1.0, axis_col));
+                    painter.line_segment([Pos2::new(plot.right(), y), Pos2::new(plot.right() + 5.0, y)], Stroke::new(1.0_f32, axis_col));
                     painter.text(Pos2::new(plot.right() + 7.0, y), Align2::LEFT_CENTER, fmt_tick(e, step), font.clone(), axis_col);
                 }
                 e += step;
@@ -396,7 +396,7 @@ impl App {
         while d <= d1 + 1e-9 {
             let tr = p.axis_trace_at_dist(if reversed { p.axis_length() - d } else { d });
             let x = fr.x_of_trace(tr);
-            painter.line_segment([Pos2::new(x, plot.bottom()), Pos2::new(x, plot.bottom() + 5.0)], Stroke::new(1.0, axis_col));
+            painter.line_segment([Pos2::new(x, plot.bottom()), Pos2::new(x, plot.bottom() + 5.0)], Stroke::new(1.0_f32, axis_col));
             painter.text(Pos2::new(x, plot.bottom() + 7.0), Align2::CENTER_TOP, fmt_tick(d, step), font.clone(), axis_col);
             d += step;
         }
@@ -406,7 +406,7 @@ impl App {
         while d <= d1 + 1e-9 {
             let x = fr.x_of_trace(p.axis_trace_at_dist(if reversed { p.axis_length() - d } else { d }));
             if x >= plot.left() - 0.5 && x <= plot.right() + 0.5 {
-                painter.line_segment([Pos2::new(x, plot.top()), Pos2::new(x, plot.top() - 4.0)], Stroke::new(1.0, axis_col));
+                painter.line_segment([Pos2::new(x, plot.top()), Pos2::new(x, plot.top() - 4.0)], Stroke::new(1.0_f32, axis_col));
                 painter.text(Pos2::new(x, plot.top() - 5.0), Align2::CENTER_BOTTOM, fmt_tick(d, step), font.clone(), axis_col);
             }
             d += step;
@@ -426,7 +426,7 @@ impl App {
         let draw_line = |l: &LinePick, open: bool, sel: bool| {
             let Some(t) = self.marker_types.get(l.type_idx) else { return };
             let pts: Vec<Pos2> = l.points.iter().map(|(tr, tt)| line_pt(*tr, *tt)).collect();
-            let w = if sel { 3.5 } else { 2.2 };
+            let w = if sel { 3.5 } else { 2.2_f32 };
             if sel {
                 plot_painter.add(egui::Shape::line(pts.clone(), Stroke::new(w + 2.0, Color32::YELLOW)));
             }
@@ -469,12 +469,12 @@ impl App {
                         if tt - m.time_ns < 25.0 * p.proc.dt.max(0.05) * 10.0 {
                             pts.push(line_pt(tr, tt));
                         } else if !pts.is_empty() {
-                            plot_painter.add(egui::Shape::dashed_line(&pts, Stroke::new(1.0, c32(t.color)), 4.0, 3.0));
+                            plot_painter.add(egui::Shape::dashed_line(&pts, Stroke::new(1.0_f32, c32(t.color)), 4.0, 3.0));
                             pts.clear();
                         }
                     }
                     if pts.len() > 1 {
-                        plot_painter.add(egui::Shape::dashed_line(&pts, Stroke::new(1.0, c32(t.color)), 4.0, 3.0));
+                        plot_painter.add(egui::Shape::dashed_line(&pts, Stroke::new(1.0_f32, c32(t.color)), 4.0, 3.0));
                     }
                 }
             }
@@ -490,8 +490,8 @@ impl App {
                 let tt = (hf.time_ns * hf.time_ns + (2.0 * dx / hf.velocity).powi(2)).sqrt();
                 pts.push(line_pt(tr, tt));
             }
-            plot_painter.add(egui::Shape::line(pts.clone(), Stroke::new(3.0, Color32::BLACK)));
-            plot_painter.add(egui::Shape::line(pts, Stroke::new(1.8, Color32::from_rgb(0, 255, 120))));
+            plot_painter.add(egui::Shape::line(pts.clone(), Stroke::new(3.0_f32, Color32::BLACK)));
+            plot_painter.add(egui::Shape::line(pts, Stroke::new(1.8_f32, Color32::from_rgb(0, 255, 120))));
             let ap = line_pt(hf.trace, hf.time_ns);
             plot_painter.circle_filled(ap, 4.0, Color32::from_rgb(0, 255, 120));
             plot_painter.text(ap + egui::vec2(8.0, 6.0), Align2::LEFT_TOP, format!("v = {:.4} m/ns  (drag a flank, Enter saves)", hf.velocity), FontId::proportional(12.0), Color32::from_rgb(0, 255, 120));
@@ -500,7 +500,7 @@ impl App {
         if let Some((mpid, mtr)) = self.map.hover_trace {
             if mpid == pid {
                 let x = fr.x_of_trace(mtr);
-                plot_painter.line_segment([Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())], Stroke::new(1.5, Color32::from_rgb(255, 60, 60)));
+                plot_painter.line_segment([Pos2::new(x, plot.top()), Pos2::new(x, plot.bottom())], Stroke::new(1.5_f32, Color32::from_rgb(255, 60, 60)));
             }
         }
 
@@ -512,8 +512,8 @@ impl App {
             // Sample of the processed data under the pointer (the topography shift removed).
             let s = (fr.sample_of_y(hp.y) - shift(tr)).clamp(0.0, (p.proc.ns as f32 - 1.0).max(0.0));
             self.hover = Some((tr, p.proc.y_of(s)));
-            plot_painter.line_segment([Pos2::new(hp.x, plot.top()), Pos2::new(hp.x, plot.bottom())], Stroke::new(0.6, Color32::from_rgba_unmultiplied(255, 255, 0, 120)));
-            plot_painter.line_segment([Pos2::new(plot.left(), hp.y), Pos2::new(plot.right(), hp.y)], Stroke::new(0.6, Color32::from_rgba_unmultiplied(255, 255, 0, 120)));
+            plot_painter.line_segment([Pos2::new(hp.x, plot.top()), Pos2::new(hp.x, plot.bottom())], Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(255, 255, 0, 120)));
+            plot_painter.line_segment([Pos2::new(plot.left(), hp.y), Pos2::new(plot.right(), hp.y)], Stroke::new(0.6_f32, Color32::from_rgba_unmultiplied(255, 255, 0, 120)));
             let tri = tr.round() as usize;
             let cur_type = self.cur_type;
             let cur_name = self.marker_types.get(cur_type).map(|t| t.name.clone()).unwrap_or_default();
@@ -521,7 +521,7 @@ impl App {
             // Snap preview
             if matches!(self.mode, PickMode::Point | PickMode::Hyperbola | PickMode::Layer) && self.snap != Snap::None {
                 let ss = self.snap_at(p, tri, s);
-                plot_painter.circle_stroke(Pos2::new(fr.x_of_trace(tri as f32), fr.y_of_sample(ss + shift(tri as f32))), 4.0, Stroke::new(1.5, Color32::from_rgb(0, 255, 255)));
+                plot_painter.circle_stroke(Pos2::new(fr.x_of_trace(tri as f32), fr.y_of_sample(ss + shift(tri as f32))), 4.0, Stroke::new(1.5_f32, Color32::from_rgb(0, 255, 255)));
             }
             // `only`: restrict to one marker type (deleting never touches other types).
             let nearest_pick = |only: Option<usize>| -> Option<u32> {
@@ -639,7 +639,7 @@ impl App {
             let (a0, b0) = self.select_rect.unwrap();
             let r = Rect::from_two_pos(a0, b0);
             plot_painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(255, 60, 60, 40));
-            plot_painter.rect_stroke(r, 0.0, Stroke::new(1.5, Color32::from_rgb(255, 60, 60)), egui::StrokeKind::Middle);
+            plot_painter.rect_stroke(r, 0.0, Stroke::new(1.5_f32, Color32::from_rgb(255, 60, 60)), egui::StrokeKind::Middle);
             let released = ui.input(|i| i.pointer.button_released(egui::PointerButton::Secondary)) || !ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
             if released {
                 // Only picks of the selected type are deleted.
@@ -696,9 +696,9 @@ impl App {
         let arect = Rect::from_min_max(Pos2::new(avail.right() - ascan_w, plot.top()), Pos2::new(avail.right(), plot.bottom()));
         let ap = ui.painter_at(arect.expand(2.0));
         ap.rect_filled(arect, 0.0, Color32::from_gray(248));
-        ap.rect_stroke(arect, 0.0, Stroke::new(1.0, Color32::from_gray(160)), egui::StrokeKind::Inside);
+        ap.rect_stroke(arect, 0.0, Stroke::new(1.0_f32, Color32::from_gray(160)), egui::StrokeKind::Inside);
         let tr_show = self.hover.map(|h| h.0.round() as usize).unwrap_or(((view.tr0 + view.tr1) / 2.0) as usize).min(p.proc.ntr.saturating_sub(1));
-        ap.line_segment([Pos2::new(arect.center().x, arect.top()), Pos2::new(arect.center().x, arect.bottom())], Stroke::new(0.5, Color32::GRAY));
+        ap.line_segment([Pos2::new(arect.center().x, arect.top()), Pos2::new(arect.center().x, arect.bottom())], Stroke::new(0.5_f32, Color32::GRAY));
         if p.proc.ntr > 0 {
             let col = p.proc.trace(tr_show);
             let sa = view.s0.max(0.0) as usize;
@@ -707,7 +707,7 @@ impl App {
             let sa = (view.s0 - off).max(0.0) as usize;
             let sb = ((view.s1 - off).ceil().max(0.0) as usize).min(p.proc.ns);
             let pts: Vec<Pos2> = (sa..sb).map(|s| Pos2::new(arect.center().x + (col[s] / (clip * 1.5)).clamp(-1.0, 1.0) * ascan_w * 0.48, fr.y_of_sample(s as f32 + off))).collect();
-            ap.add(egui::Shape::line(pts, Stroke::new(1.0, Color32::BLACK)));
+            ap.add(egui::Shape::line(pts, Stroke::new(1.0_f32, Color32::BLACK)));
         }
         ap.text(arect.left_top() + egui::vec2(3.0, 2.0), Align2::LEFT_TOP, format!("trace {}", tr_show + 1), FontId::proportional(10.5), Color32::DARK_GRAY);
     }

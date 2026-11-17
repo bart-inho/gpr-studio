@@ -1384,7 +1384,7 @@ impl App {
             }
             ui.checkbox(&mut self.pdf_opts.basemap, "Basemap under the GPS tracks");
             ui.checkbox(&mut self.pdf_opts.markers, "Markers and layer picks (data view and map)");
-            ui.checkbox(&mut self.pdf_opts.processing, "Processing sequence and pick table");
+            ui.checkbox(&mut self.pdf_opts.processing, "Processing sequence and pick list");
             ui.weak("Each page shows the radargram with its axes, the GPS map with the same section highlighted, a scale bar, north arrow and the profile information.");
             if ui.button(RichText::new("Save PDF…").strong()).clicked() {
                 go = true;
@@ -2116,7 +2116,7 @@ fn spectrum_plot(ui: &mut egui::Ui, spec: &[(f32, f32)], step: &Step) {
     let amax = spec.iter().map(|s| s.1).fold(0.0, f32::max).max(1e-20);
     let fmax = spec.iter().rev().find(|(_, a)| *a > amax * 0.01).map(|s| s.0 * 1.3).unwrap_or(1000.0).max(50.0);
     let pts: Vec<egui::Pos2> = spec.iter().filter(|(f, _)| *f <= fmax).map(|(f, a)| egui::pos2(rect.left() + f / fmax * rect.width(), rect.bottom() - a / amax * (rect.height() - 14.0))).collect();
-    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5, Color32::from_rgb(30, 80, 200))));
+    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.5_f32, Color32::from_rgb(30, 80, 200))));
     let mut fp = Vec::new();
     for k in 0..200 {
         let f = fmax * k as f32 / 199.0;
@@ -2132,7 +2132,7 @@ fn spectrum_plot(ui: &mut egui::Ui, spec: &[(f32, f32)], step: &Step) {
         };
         fp.push(egui::pos2(rect.left() + f / fmax * rect.width(), rect.bottom() - w * (rect.height() - 14.0)));
     }
-    painter.add(egui::Shape::line(fp, egui::Stroke::new(1.5, Color32::from_rgb(220, 60, 30))));
+    painter.add(egui::Shape::line(fp, egui::Stroke::new(1.5_f32, Color32::from_rgb(220, 60, 30))));
     painter.text(rect.left_top() + egui::vec2(4.0, 2.0), egui::Align2::LEFT_TOP, "spectrum (blue), filter (red)", egui::FontId::proportional(11.0), text);
     painter.text(rect.right_bottom() - egui::vec2(4.0, 2.0), egui::Align2::RIGHT_BOTTOM, format!("{fmax:.0} MHz"), egui::FontId::proportional(11.0), text);
 }

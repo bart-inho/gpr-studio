@@ -29,7 +29,7 @@ picking, mapping and reporting. Written in Rust with egui; runs on Windows, macO
   as vertically; time sections use the toolbar velocity. A profile too short to fill the width is drawn narrower.
 - **Picking** – typed point markers, hyperbola velocity fitting, layer lines with phase following and snapping; Ctrl+Z undoes picking steps and deletions.
 - **Export** – GeoPackage (profiles, markers, layer picks, trace points), SEG-Y of chosen processing steps,
-  PDF report (radargram with optional exact 1×1 metre scale and a minimum section width, plus a whole-survey map capped at a quarter page height with the same section highlighted), CSV of picks.
+  PDF report (the top three quarters for the radargram, with optional exact 1×1 metre scale and a minimum section width; the bottom quarter split equally between the whole-survey map, profile details, and processing), CSV of picks.
 - **Projects** – `.gprproj` files keep the file list, processing, GPS, picks, CRS and basemaps.
   Ctrl+S saves to the project's file, File › Open last project reopens the previous one, and closing only
   asks to save when something changed. Files inside the project's folder are stored with relative paths;
