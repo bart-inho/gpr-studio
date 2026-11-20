@@ -25,6 +25,37 @@ pub enum PickMode {
 }
 
 #[cfg(test)]
+mod profile_csv_tests {
+    use super::*;
+
+    #[test]
+    fn exports_all_profiles_and_header_fields() {
+        let mut app = App::headless(vec![], None);
+        for n in 1..=2 {
+            let mut p = Profile::new(format!("line_{n:03}"), PathBuf::from(format!("line_{n:03}.rd3")), "MALA RD3", Section::new(5, 3, 0.5), 0.25);
+            p.header = if n == 1 { vec![("antenna".into(), "400 MHz, \"shielded\"".into())] } else { vec![("zero level".into(), "12".into())] };
+            app.add_profile(p);
+        }
+        let cor = std::env::temp_dir().join(format!("gpr-profile-clock-{}.cor", std::process::id()));
+        std::fs::write(&cor, "1 2026-11-20 08.09.10 46.9511 N 7.4386 E 500 M 4\n3 2026-11-20 08:12:13.4 46.9513 N 7.4388 E 501 M 4\n").unwrap();
+        app.profiles[0].gps = Some(crate::gps::read(&cor, GpsFormat::Auto, 3, &app.project_crs).unwrap());
+        std::fs::remove_file(cor).unwrap();
+        app.markers.push(Marker { id: 1, profile_id: app.profiles[0].id, type_idx: 0, trace: 1.0, time_ns: 0.5, amplitude: 1.0, velocity: None, comment: "excluded pick".into() });
+        let path = std::env::temp_dir().join(format!("gpr-profiles-{}.csv", std::process::id()));
+        assert_eq!(app.export_profiles_csv(&path).unwrap(), 2);
+        let csv = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let rows: Vec<_> = csv.lines().collect();
+        assert_eq!(rows.len(), 3);
+        assert!(!csv.contains("excluded pick"));
+        assert!(rows[0].contains("start_time_hh_mm_ss,end_time_hh_mm_ss,sample_start_ns,sample_stop_ns") && rows[0].contains("meta:antenna") && rows[0].contains("meta:zero level"));
+        assert!(rows[1].contains("\"line_001\",\"001\",\"line_001.rd3\"") && rows[1].contains("\"08.09.10\",\"08.12.13\",\"0\",\"2\",\"2.5\",\"0.5\",\"0.25\",\"0.5\""));
+        assert!(rows[1].contains("\"400 MHz, \"\"shielded\"\"\""));
+        assert!(rows[2].contains("\"line_002\",\"002\"") && rows[2].ends_with(",\"12\""));
+    }
+}
+
+#[cfg(test)]
 mod manual_map_tests {
     use super::*;
 
@@ -262,6 +293,7 @@ pub struct App {
     pub map_mode: MapMode,
     pub manual_grid: Option<ManualGrid>,
     pub basemaps: Vec<Basemap>,
+    pub shapefiles: Vec<crate::shapefile::Overlay>,
     pub basemap_jobs: Vec<BasemapJob>,
     pub show_map: bool,
     /// Last docked placement (Right or Bottom), restored when the map window is closed.
@@ -314,6 +346,8 @@ pub struct App {
     pub collect_report: Option<String>,
     /// Show layer picks of crossing profiles in the data view.
     pub show_crossings: bool,
+    /// Show saved picks in the data view and map.
+    pub show_picks: bool,
     /// (coordinates key, crossings) — recomputed when the coordinates change.
     pub crossings: (u64, Vec<crate::interp::Crossing>),
     pub zones: Vec<crate::interp::Zone>,
@@ -525,6 +559,7 @@ impl App {
             map_mode: MapMode::Gps,
             manual_grid: None,
             basemaps: Vec::new(),
+            shapefiles: Vec::new(),
             basemap_jobs: Vec::new(),
             show_map: true,
             map_dock: MapPlacement::Right,
@@ -565,6 +600,7 @@ impl App {
             collect_confirm: None,
             collect_report: None,
             show_crossings: true,
+            show_picks: true,
             crossings: (0, Vec::new()),
             zones: Vec::new(),
             interp: Default::default(),
@@ -1782,9 +1818,49 @@ impl App {
                             }
                         }
                     }
+                    if ui.button("Profiles infos as CSV…").clicked() {
+                        ui.close_menu();
+                        if let Some(f) = self.export_dialog().add_filter("CSV", &["csv"]).set_file_name("profiles_infos.csv").save_file() {
+                            match self.export_profiles_csv(&f) {
+                                Ok(n) => self.status = format!("{n} profiles written to {}", f.display()),
+                                Err(e) => self.status = e,
+                            }
+                        }
+                    }
                 });
             });
         });
+    }
+
+    pub fn export_profiles_csv(&self, path: &std::path::Path) -> Result<usize, String> {
+        fn cell(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
+        let keys: std::collections::BTreeSet<&str> = self.profiles.iter().flat_map(|p| p.header.iter().map(|(k, _)| k.as_str())).collect();
+        let mut csv = String::from("profile_name,profile_number,file_name,file_path,format,channel,traces,samples,start_time_hh_mm_ss,end_time_hh_mm_ss,sample_start_ns,sample_stop_ns,time_window_ns,sample_interval_ns,trace_spacing_m,distance_m,antenna_frequency_mhz,velocity_m_ns,gps_source,gps_crs,gps_fixes");
+        for key in &keys { csv.push_str(&format!(",{}", cell(&format!("meta:{key}")))); }
+        csv.push('\n');
+        for p in &self.profiles {
+            let number = short_label(&p.name);
+            let (start, end) = p.gps.as_ref().and_then(|g| crate::gps::cor_clock_range(g, &p.path)).unwrap_or_default();
+            let row = [
+                p.name.clone(), if number.chars().all(|c| c.is_ascii_digit()) { number } else { String::new() },
+                p.path.file_name().unwrap_or_default().to_string_lossy().into_owned(), p.path.display().to_string(), p.format.clone(),
+                (p.channel + 1).to_string(), p.raw.ntr.to_string(), p.raw.ns.to_string(),
+                start, end,
+                p.raw.t0.to_string(), p.raw.y_max().to_string(), (p.raw.dt * p.raw.ns as f32).to_string(), p.raw.dt.to_string(),
+                p.dx.to_string(), p.length().to_string(), p.freq_mhz.to_string(), p.velocity.to_string(),
+                p.gps.as_ref().map(|g| g.source.clone()).unwrap_or_default(),
+                p.gps.as_ref().map(|g| g.crs.short()).unwrap_or_default(),
+                p.gps.as_ref().map(|g| g.fixes.len().to_string()).unwrap_or_default(),
+            ];
+            csv.push_str(&row.iter().map(|s| cell(s)).collect::<Vec<_>>().join(","));
+            for key in &keys {
+                csv.push(',');
+                csv.push_str(&cell(p.header.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()).unwrap_or("")));
+            }
+            csv.push('\n');
+        }
+        std::fs::write(path, csv).map_err(|e| e.to_string())?;
+        Ok(self.profiles.len())
     }
 
     pub fn export_csv(&self, path: &std::path::Path) -> Result<usize, String> {
@@ -1856,7 +1932,15 @@ impl App {
                             self.finish_line();
                         }
                         self.mode = m;
+                        if m != PickMode::Navigate { self.show_picks = true; }
                     }
+                }
+                if ui.button(if self.show_picks { "Hide picks" } else { "Show picks" }).clicked() {
+                    if self.show_picks {
+                        if self.mode == PickMode::Layer { self.finish_line(); }
+                        self.mode = PickMode::Navigate;
+                    }
+                    self.show_picks = !self.show_picks;
                 }
                 ui.separator();
                 let want_kind = if self.mode == PickMode::Layer { MarkerKind::Line } else { MarkerKind::Point };

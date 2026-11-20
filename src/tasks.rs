@@ -306,7 +306,7 @@ mod tests {
         let steps = app.profiles[0].steps.clone();
         let mut stale = Section::new(2, 2, 1.0);
         stale.data.fill(99.0);
-        app.profiles[0].gps = Some(crate::model::GpsTrack { source: "new GPS".into(), crs: app.project_crs.clone(), fixes: vec![] });
+        app.profiles[0].gps = Some(crate::model::GpsTrack { source: "new GPS".into(), crs: app.project_crs.clone(), fixes: vec![], clock_range: None });
         app.finish_task(Output::Processed(vec![(id, stale, vec![], steps, 0.05, 0.0, None, app.project_crs.clone())]), 0.0, false);
         assert_eq!(app.profiles[0].proc.data, vec![0.0; 4]);
     }

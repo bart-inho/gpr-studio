@@ -10,7 +10,9 @@ picking, mapping and reporting. Written in Rust with egui; runs on Windows, macO
 - **GPS** – one dialog for all imported profiles; GPS files (`.cor`, `.dzg`, `.gps`, NMEA, CSV/TXT,
   SEG-Y trace headers) are matched automatically by file name, including channel endings such as `_0`/`_1`.
 - **Map** – GPS tracks of every profile, the part shown in the data view highlighted, markers and layer picks,
-  GeoTIFF basemaps of any size, any output coordinate system (EPSG code or PROJ string; default EPSG:2056).
+  GeoTIFF basemaps of any size and shapefile overlays (points, lines and polygon outlines), any output coordinate system
+  (EPSG code or PROJ string; default EPSG:2056). Shapefile CRS comes from its `.prj` EPSG authority when available,
+  or can be set in the map panel.
   The map sits on the right, at the bottom of the main window (full width for long profiles) or in its own
   window (buttons in the map header, or the Map menu); the choice is kept for the next start.
   The map header can switch to **Manual projection** for a local Proceq area-scan grid. Import a tab-separated
@@ -49,17 +51,18 @@ picking, mapping and reporting. Written in Rust with egui; runs on Windows, macO
   drawn on every profile they cover as a pink dashed line. Both are read-only.
 - **Export** – GeoPackage (GPS profiles, markers, layer picks, optional trace points and layer vertices,
   plus one Float32 interpolations raster), SEG-Y of chosen processing steps,
-  PDF report (the top three quarters for the radargram, with optional exact 1×1 metre scale and a minimum section width; the bottom quarter split equally between the whole-survey map, profile details, and processing), CSV of picks.
+  PDF report (the top three quarters for the radargram, with optional exact 1×1 metre scale and a minimum section width; the bottom quarter split equally between the whole-survey map, profile details, and processing), CSV of picks, and profiles infos CSV with one row per profile and all available file-header fields. The latter includes first and last GPS clock times from associated `.cor` files; radar sample times are separate columns.
   The GeoPackage **Interpolations raster** stores Depth (m), Time (ns), or Altitude (m), chosen in
   the export dialog. Export again to a different file for another quantity; the others remain in the
   project. Empty cells and tile padding use NoData `-9999` and appear transparent. A projected CRS
   in metres is required; vector export still succeeds when the raster is skipped for a geographic CRS.
-- **Projects** – `.gprproj` files keep the file list, processing, GPS, picks, CRS and basemaps.
+- **Projects** – `.gprproj` files keep the file list, processing, GPS, picks, CRS, basemaps and shapefile overlays.
   Ctrl+S saves to the project's file, File › Open last project reopens the previous one, and closing only
   asks to save when something changed. Files inside the project's folder are stored with relative paths;
   a missing file is also looked for by name in the project's `data/` folder.
   **File › Collect and save project…** copies the project and every file it uses (data files with their
-  headers such as `.rad`/`.iprh`/`.hd`/REFLEXW `.??R`, original GPS files, GeoTIFFs with their world files)
+  headers such as `.rad`/`.iprh`/`.hd`/REFLEXW `.??R`, original GPS files, GeoTIFFs with their world files,
+  and shapefiles with companion files)
   into one folder (`<name>/<name>.gprproj`, `<name>/data/`, `data/gps/`, `data/basemaps/`) that can be zipped
   and opened on another computer. Files with the same name get a `_2` ending; nothing is overwritten or
   deleted. Demo profiles have no file and are skipped.

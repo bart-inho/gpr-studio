@@ -66,6 +66,8 @@ pub struct GpsTrack {
     pub source: String,
     pub crs: CrsSpec,
     pub fixes: Vec<GpsFix>,
+    #[serde(default)]
+    pub clock_range: Option<(String, String)>,
 }
 
 pub fn point_at(coords: &[[f64; 3]], trace: f32) -> Option<[f64; 3]> {
@@ -284,7 +286,8 @@ impl Profile {
             .iter()
             .zip(pts)
             .filter(|(_, p)| p[0].is_finite() && p[1].is_finite())
-            .map(|(f, p)| (f.trace, p))
+            // The GPS height has no declared vertical CRS; reproject x/y but keep its recorded altitude.
+            .map(|(f, mut p)| { p[2] = f.z; (f.trace, p) })
             .collect();
         fixes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         fixes.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-9);
@@ -805,7 +808,7 @@ mod orientation_tests {
         let crs = CrsSpec::Epsg(2056);
         let mut p = Profile::new("test".into(), PathBuf::new(), "test", Section::new(10, 5, 0.2), 0.5);
         p.use_gps_distance = false;
-        p.gps = Some(GpsTrack { source: "measured".into(), crs: crs.clone(), fixes: (0..5).map(|i| GpsFix { trace: i as f64, x: 2_600_000.0 + i as f64, y: 1_200_000.0, z: 500.0 + i as f64 * 0.1, has_elevation: true }).collect() });
+        p.gps = Some(GpsTrack { source: "measured".into(), crs: crs.clone(), fixes: (0..5).map(|i| GpsFix { trace: i as f64, x: 2_600_000.0 + i as f64, y: 1_200_000.0, z: 500.0 + i as f64 * 0.1, has_elevation: true }).collect(), clock_range: None });
         p.update_coords(&crs);
         let g = p.topographic_geometry(&crs, 1.1).unwrap();
         assert_eq!(g.x_m, vec![0.0, 1.0, 2.0, 3.0, 4.0]);

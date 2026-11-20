@@ -51,17 +51,17 @@ pub fn read(path: &Path, fmt: GpsFormat, ntr: usize, table_crs: &CrsSpec) -> Res
     let raw = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let text = String::from_utf8_lossy(&raw).to_string();
     let fmt = if fmt == GpsFormat::Auto { detect(path, &text) } else { fmt };
-    let (fixes, crs) = match fmt {
-        GpsFormat::Cor => (read_cor(&text), CrsSpec::Epsg(4326)),
-        GpsFormat::Dzg => (read_tagged_nmea(&text, "$GSSIS"), CrsSpec::Epsg(4326)),
-        GpsFormat::PulseEkko => (read_pulseekko(&text), CrsSpec::Epsg(4326)),
-        GpsFormat::Nmea => (spread(read_nmea_all(&text), ntr), CrsSpec::Epsg(4326)),
-        GpsFormat::Csv | GpsFormat::Auto => read_table(&text, table_crs),
+    let (fixes, crs, clock_range) = match fmt {
+        GpsFormat::Cor => { let (fixes, clock_range) = read_cor(&text); (fixes, CrsSpec::Epsg(4326), clock_range) },
+        GpsFormat::Dzg => (read_tagged_nmea(&text, "$GSSIS"), CrsSpec::Epsg(4326), None),
+        GpsFormat::PulseEkko => (read_pulseekko(&text), CrsSpec::Epsg(4326), None),
+        GpsFormat::Nmea => (spread(read_nmea_all(&text), ntr), CrsSpec::Epsg(4326), None),
+        GpsFormat::Csv | GpsFormat::Auto => { let (fixes, crs) = read_table(&text, table_crs); (fixes, crs, None) },
     };
     if fixes.is_empty() {
         return Err(format!("no positions found in {} (read as {})", path.display(), fmt.name()));
     }
-    Ok(GpsTrack { source: format!("{} [{}]", path.file_name().and_then(|n| n.to_str()).unwrap_or(""), fmt.name()), crs, fixes })
+    Ok(GpsTrack { source: format!("{} [{}]", path.file_name().and_then(|n| n.to_str()).unwrap_or(""), fmt.name()), crs, fixes, clock_range })
 }
 
 fn detect(path: &Path, text: &str) -> GpsFormat {
@@ -81,8 +81,16 @@ fn detect(path: &Path, text: &str) -> GpsFormat {
     GpsFormat::Csv
 }
 
-fn read_cor(text: &str) -> Vec<GpsFix> {
+fn cor_clock(token: &str) -> Option<String> {
+    let fields: Vec<_> = token.split([':', '.']).collect();
+    if !(3..=4).contains(&fields.len()) || (fields.len() == 4 && !fields[3].chars().all(|c| c.is_ascii_digit())) { return None; }
+    let (h, m, s) = (fields[0].parse::<u8>().ok()?, fields[1].parse::<u8>().ok()?, fields[2].parse::<u8>().ok()?);
+    (h < 24 && m < 60 && s < 60).then(|| format!("{h:02}.{m:02}.{s:02}"))
+}
+
+fn read_cor(text: &str) -> (Vec<GpsFix>, Option<(String, String)>) {
     let mut out = Vec::new();
+    let (mut start, mut end) = (None, None);
     for line in text.lines() {
         let tok: Vec<&str> = line.split(|c: char| c == '\t' || c == ',' || c == ';' || c == ' ').filter(|s| !s.is_empty()).collect();
         if tok.len() < 6 {
@@ -114,9 +122,118 @@ fn read_cor(text: &str) -> Vec<GpsFix> {
         if let (Some(la), Some(lo)) = (lat, lon) {
             // .cor trace numbers start at 1.
             out.push(GpsFix { trace: (trace - 1.0).max(0.0), x: lo, y: la, z: alt.unwrap_or(0.0), has_elevation: alt.is_some() });
+            if let Some(time) = tok.get(2).and_then(|s| cor_clock(s)) {
+                if start.is_none() { start = Some(time.clone()); }
+                end = Some(time);
+            }
         }
     }
-    out
+    (out, start.zip(end))
+}
+
+pub fn cor_clock_range(track: &GpsTrack, data_path: &Path) -> Option<(String, String)> {
+    if let Some(range) = &track.clock_range { return Some(range.clone()); }
+    let name = track.source.split(" [").next()?;
+    if !Path::new(name).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("cor")) { return None; }
+    for path in search_dirs(data_path, None).into_iter().map(|dir| dir.join(name)) {
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        let (fixes, range) = read_cor(&String::from_utf8_lossy(&bytes));
+        if fixes.len() == track.fixes.len() && fixes.iter().zip(&track.fixes).all(|(a, b)| (a.trace, a.x, a.y, a.z) == (b.trace, b.x, b.y, b.z)) {
+            return range;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod altitude_investigation {
+    use super::*;
+    use crate::model::{Profile, Section};
+
+    #[test]
+    fn cor_height_through_reprojection() {
+        let lines = "1 2026-11-20 12:00:00 46.9511 N 7.4386 E 500.000 M 4\n3 2026-11-20 12:00:02 46.9513 N 7.4388 E 501.000 M 4\n";
+        let path = std::env::temp_dir().join(format!("gpr-altitude-investigation-{}.cor", std::process::id()));
+        std::fs::write(&path, lines).unwrap();
+        let imported = read(&path, GpsFormat::Auto, 3, &CrsSpec::Epsg(2056)).unwrap();
+        let mut old_project_track = imported.clone();
+        old_project_track.clock_range = None;
+        assert_eq!(cor_clock_range(&old_project_track, &path.with_extension("iprb")), Some(("12.00.00".into(), "12.00.02".into())));
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(imported.crs, CrsSpec::Epsg(4326));
+        assert_eq!(imported.clock_range, Some(("12.00.00".into(), "12.00.02".into())));
+        let (fixes, range) = read_cor(lines);
+        assert_eq!(range, Some(("12.00.00".into(), "12.00.02".into())));
+        assert_eq!(imported.fixes, fixes);
+        assert_eq!((fixes[0].trace, fixes[0].z, fixes[1].trace, fixes[1].z), (0.0, 500.0, 2.0, 501.0));
+        for target in [CrsSpec::Epsg(4326), CrsSpec::Epsg(2056), CrsSpec::Epsg(32632)] {
+            for f in &fixes {
+                let mut xyz = [[f.x, f.y, f.z]];
+                crate::crs::transform_spec(&CrsSpec::Epsg(4326), &target, &mut xyz).unwrap();
+                let mut zero = [[f.x, f.y, 0.0]];
+                crate::crs::transform_spec(&CrsSpec::Epsg(4326), &target, &mut zero).unwrap();
+                println!("{:?} trace={} cor_z={:.3} transformed={:?} dz={:.6} xy_at_zero={:?}", target, f.trace, f.z, xyz[0], xyz[0][2] - f.z, &zero[0][..2]);
+            }
+            let mut p = Profile::new("synthetic".into(), "synthetic.cor".into(), "test", Section { ntr: 3, ns: 2, dt: 1.0, t0: 0.0, depth_axis: false, depth_datum_m: None, data: vec![0.0; 6] }, 0.0);
+            p.gps = Some(imported.clone());
+            p.update_coords(&target);
+            println!("{:?} per_trace_z={:?} midpoint_coord={:?} picked_at_2m={:.6}", target, p.coords.iter().map(|c| c[2]).collect::<Vec<_>>(), p.coord_at(1.0).unwrap(), p.coord_at(1.0).unwrap()[2] - 2.0);
+            assert_eq!(p.coords.iter().map(|c| c[2]).collect::<Vec<_>>(), [500.0, 500.5, 501.0]);
+            if target == CrsSpec::Epsg(2056) {
+                assert!((p.coords[0][0] - 2_599_997.526_851).abs() < 0.001);
+                assert!((p.coords[0][1] - 1_200_001.904_897).abs() < 0.001);
+                p.show_topo = true;
+                let (datum, shifts) = p.topo_shifts().unwrap();
+                println!("topographic_display datum={datum:.6} trace0_surface={:.6} trace0_shift_samples={:.6}", p.coords[0][2], shifts[0]);
+                assert_eq!(datum, 501.0);
+                assert!((shifts[0] - 20.0).abs() < 1e-5);
+                let topo = p.topographic_geometry(&target, 100.0).unwrap();
+                assert_eq!(topo.elevation_m, [500.0, 500.5, 501.0]);
+                let out = std::env::temp_dir().join(format!("gpr-altitude-investigation-{}.sgy", std::process::id()));
+                let meta = crate::segy_export::SegyMeta { name: "synthetic".into(), source: "synthetic.cor".into(), line_no: 1, coords: p.coords.clone(), dist: p.dist.clone(), crs_label: target.short(), geographic: false, freq_mhz: 400.0, velocity: 0.1, dx: 1.0 };
+                crate::segy_export::write(&out, &p.proc, &meta, "RAW", &[]).unwrap();
+                let bytes = std::fs::read(&out).unwrap();
+                std::fs::remove_file(out).unwrap();
+                let exported = i32::from_be_bytes(bytes[3600 + 40..3600 + 44].try_into().unwrap()) as f64 / 100.0;
+                println!("SEG-Y trace0_elevation={exported:.3} delta_from_cor={:.3}", exported - fixes[0].z);
+                assert_eq!(exported, 500.0);
+            }
+        }
+        for (label, lon, lat) in [("Geneva", 6.1432, 46.2044), ("Zurich", 8.5417, 47.3769), ("Lugano", 8.9511, 46.0037)] {
+            let mut xyz = [[lon, lat, 500.0]];
+            crate::crs::transform_spec(&CrsSpec::Epsg(4326), &CrsSpec::Epsg(2056), &mut xyz).unwrap();
+            println!("{label} source=[{lon},{lat},500] LV95={:?} dz={:.6}", xyz[0], xyz[0][2] - 500.0);
+        }
+        let json = serde_json::to_string(&imported).unwrap();
+        let restored: GpsTrack = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.fixes, fixes);
+        let mut p = Profile::new("synthetic".into(), "synthetic.cor".into(), "test", Section { ntr: 3, ns: 2, dt: 1.0, t0: 0.0, depth_axis: false, depth_datum_m: None, data: vec![0.0; 6] }, 0.0);
+        p.gps = Some(restored);
+        for target in [2056, 32632, 4326, 2056] {
+            p.update_coords(&CrsSpec::Epsg(target));
+            println!("reproject EPSG:{target} trace0_z={:.6} raw_z={:.6}", p.coords[0][2], p.gps.as_ref().unwrap().fixes[0].z);
+            assert_eq!(p.coords[0][2], 500.0);
+        }
+        let mut app = crate::app::App::headless(vec![], None);
+        app.remember_projects = false;
+        let mut demo = crate::demo::make().remove(0);
+        demo.gps = Some(imported);
+        app.add_profile(demo);
+        let before = app.profiles[0].coords[0][2];
+        assert_eq!(before, 500.0);
+        let project_path = std::env::temp_dir().join(format!("gpr-altitude-investigation-{}.gprproj", std::process::id()));
+        crate::project::save(&app, &project_path).unwrap();
+        let file = crate::project::parse(&project_path).unwrap();
+        let loaded = crate::project::load_profiles(file, project_path.clone(), &crate::processing::Progress::new());
+        let mut reopened = crate::app::App::headless(vec![], None);
+        reopened.remember_projects = false;
+        crate::project::apply(&mut reopened, loaded);
+        std::fs::remove_file(project_path).unwrap();
+        println!("project_reopen trace0_z_before={before:.6} after={:.6} raw_z={:.6}", reopened.profiles[0].coords[0][2], reopened.profiles[0].gps.as_ref().unwrap().fixes[0].z);
+        assert!((reopened.profiles[0].coords[0][2] - before).abs() < 1e-9);
+        assert_eq!(reopened.profiles[0].gps.as_ref().unwrap().fixes[0].z, 500.0);
+        assert_eq!(reopened.profiles[0].gps.as_ref().unwrap().clock_range, Some(("12.00.00".into(), "12.00.02".into())));
+    }
 }
 
 /// Values above 180 are ddmm.mmmm (NMEA style).

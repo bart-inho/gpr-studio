@@ -474,7 +474,7 @@ pub fn read_segy(path: &Path, opt: &ImportOptions) -> Result<Profile, String> {
                 p.dx = (d / (z.trace - a.trace).max(1.0)) as f32;
             }
         }
-        p.embedded_gps = Some(GpsTrack { source: "SEG-Y trace headers".into(), crs, fixes });
+        p.embedded_gps = Some(GpsTrack { source: "SEG-Y trace headers".into(), crs, fixes, clock_range: None });
     }
     p.header = vec![
         ("byte order".into(), if le { "little endian".into() } else { "big endian".into() }),

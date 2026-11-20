@@ -442,10 +442,10 @@ impl App {
                 plot_painter.text(*f + egui::vec2(4.0, -4.0), Align2::LEFT_BOTTOM, format!("#{} {}", l.id, t.name), FontId::proportional(10.5), c32(t.color));
             }
         };
-        for l in self.lines.iter().filter(|l| l.profile_id == pid) {
+        for l in self.lines.iter().filter(|l| self.show_picks && l.profile_id == pid) {
             draw_line(l, false, self.selected_pick == Some(l.id));
         }
-        if let Some(l) = &self.open_line {
+        if let Some(l) = self.open_line.as_ref().filter(|_| self.show_picks) {
             if l.profile_id == pid {
                 draw_line(l, true, false);
             }
@@ -474,7 +474,7 @@ impl App {
             }
         }
         // Layer picks of crossing profiles, where they cross this one (read-only).
-        if self.show_crossings {
+        if self.show_picks && self.show_crossings {
             let mut hovered = None;
             for c in crate::interp::crossing_picks(&self.profiles, &self.lines, &self.crossings.1, pid) {
                 let pos = line_pt(c.trace, c.time_ns);
@@ -495,7 +495,7 @@ impl App {
                 });
             }
         }
-        for m in self.markers.iter().filter(|m| m.profile_id == pid) {
+        for m in self.markers.iter().filter(|m| self.show_picks && m.profile_id == pid) {
             let Some(t) = self.marker_types.get(m.type_idx) else { continue };
             let pos = marker_pos(m);
             if !plot.expand(10.0).contains(pos) {
@@ -527,7 +527,7 @@ impl App {
             }
         }
         // Active hyperbola fit
-        if let Some(hf) = self.hyperbola.as_ref().filter(|_| !migrated) {
+        if let Some(hf) = self.hyperbola.as_ref().filter(|_| self.show_picks && !migrated) {
             let mut pts = Vec::new();
             let d0 = p.dist_at(hf.trace);
             let n = plot.width() as usize / 2;
@@ -572,6 +572,7 @@ impl App {
             }
             // `only`: restrict to one marker type (deleting never touches other types).
             let nearest_pick = |only: Option<usize>| -> Option<u32> {
+                if !self.show_picks { return None; }
                 let ok = |t: usize| only.map(|o| o == t).unwrap_or(true);
                 let mut best: Option<(f32, u32)> = None;
                 for m in self.markers.iter().filter(|m| m.profile_id == pid && ok(m.type_idx)) {

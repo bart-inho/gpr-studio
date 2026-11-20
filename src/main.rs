@@ -2,6 +2,7 @@
 
 mod app;
 mod basemap;
+mod shapefile;
 mod crs;
 mod dataview;
 mod demo;

@@ -50,6 +50,19 @@ impl App {
             }
         }
         if x0 > x1 {
+            for layer in self.shapefiles.iter().filter(|s| s.visible) {
+                for part in &layer.parts {
+                    let mut pts: Vec<[f64; 3]> = part.iter().map(|p| [p[0], p[1], 0.0]).collect();
+                    if crate::crs::transform_spec(&layer.crs, &self.project_crs, &mut pts).is_ok() {
+                        for p in pts.into_iter().filter(|p| p[0].is_finite() && p[1].is_finite()) {
+                            x0 = x0.min(p[0]); x1 = x1.max(p[0]);
+                            y0 = y0.min(p[1]); y1 = y1.max(p[1]);
+                        }
+                    }
+                }
+            }
+        }
+        if x0 > x1 {
             return;
         }
         let w = (x1 - x0).max(1e-6);
@@ -133,6 +146,16 @@ impl App {
                     }
                 }
             }
+            if ui.add_enabled(self.map_mode == MapMode::Gps, egui::Button::new("+ Shapefile")).on_hover_text("Add a shapefile overlay (.shp)").clicked() {
+                if let Some(files) = rfd::FileDialog::new().add_filter("Shapefile", &["shp"]).pick_files() {
+                    for path in files {
+                        match crate::shapefile::load(path, &self.project_crs) {
+                            Ok(layer) => { self.status = format!("Imported {}.", layer.name); self.shapefiles.push(layer); self.map.fitted = false; }
+                            Err(e) => self.status = format!("Shapefile import failed: {e}"),
+                        }
+                    }
+                }
+            }
             if ui.add_enabled(self.map_mode == MapMode::Gps, egui::Button::new(self.project_crs.short())).on_hover_text(format!("{}\nClick to change the output coordinate system", self.project_crs.label())).clicked() {
                 self.show_crs = true;
             }
@@ -175,6 +198,23 @@ impl App {
                 if let Some(i) = remove {
                     self.basemaps.remove(i);
                 }
+            });
+        }
+        if !manual && !self.shapefiles.is_empty() {
+            egui::CollapsingHeader::new(format!("Shapefiles ({})", self.shapefiles.len())).default_open(false).show(ui, |ui| {
+                let mut remove = None;
+                for (i, layer) in self.shapefiles.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(&mut layer.visible, "").changed() { self.map.fitted = false; }
+                        ui.label(&layer.name);
+                        let mut t = match &layer.crs { crate::crs::CrsSpec::Epsg(c) => c.to_string(), crate::crs::CrsSpec::Proj(s) => s.clone() };
+                        if ui.add(egui::TextEdit::singleline(&mut t).desired_width(56.0)).on_hover_text("Shapefile CRS (EPSG)").lost_focus() {
+                            if let Some(c) = crate::crs::CrsSpec::parse(&t) { if c != layer.crs { layer.crs = c; self.map.fitted = false; } }
+                        }
+                        if ui.small_button("✖").clicked() { remove = Some(i); }
+                    });
+                }
+                if let Some(i) = remove { self.shapefiles.remove(i); self.map.fitted = false; }
             });
         }
         let avail = ui.available_rect_before_wrap();
@@ -348,6 +388,18 @@ impl App {
             }
         }
 
+        // ---------------------------------------------------------- shapefile overlays
+        for layer in self.shapefiles.iter().filter(|s| !manual && s.visible) {
+            let color = Color32::from_rgb(30, 115, 65);
+            for part in &layer.parts {
+                let mut pts: Vec<[f64; 3]> = part.iter().map(|p| [p[0], p[1], 0.0]).collect();
+                if crate::crs::transform_spec(&layer.crs, &project, &mut pts).is_err() { continue; }
+                let screen: Vec<Pos2> = pts.into_iter().filter(|p| p[0].is_finite() && p[1].is_finite()).map(|p| to_s(p[0], p[1])).collect();
+                if screen.len() == 1 { painter.circle_filled(screen[0], 3.0, color); }
+                else if screen.len() > 1 { painter.add(egui::Shape::line(screen, Stroke::new(1.5_f32, color))); }
+            }
+        }
+
         // ---------------------------------------------------------- interpolation zones
         for z in self.zones.iter().filter(|z| !manual && z.visible) {
             if let Some(g) = &z.grid {
@@ -432,7 +484,7 @@ impl App {
             }
         }
         // Layer picks on the map
-        for l in &self.lines {
+        for l in self.lines.iter().filter(|_| self.show_picks) {
             let Some(p) = self.profiles.iter().find(|p| p.id == l.profile_id) else { continue };
             let Some(t) = self.marker_types.get(l.type_idx) else { continue };
             if p.map_coords(manual).is_empty() {
@@ -442,7 +494,7 @@ impl App {
             painter.add(egui::Shape::dashed_line(&pts, Stroke::new(3.0_f32, c32(t.color)), 6.0, 3.0));
         }
         // Markers
-        for m in &self.markers {
+        for m in self.markers.iter().filter(|_| self.show_picks) {
             let Some(p) = self.profiles.iter().find(|p| p.id == m.profile_id) else { continue };
             let Some(t) = self.marker_types.get(m.type_idx) else { continue };
             if let Some(c) = crate::model::point_at(p.map_coords(manual), m.trace) {
@@ -510,8 +562,8 @@ impl App {
         // ---------------------------------------------------------- decorations
         if manual && self.manual_grid.is_none() {
             painter.text(rect.center(), Align2::CENTER_CENTER, "Import a Proceq area-scan CSV to show the manual grid.", FontId::proportional(13.0), weak);
-        } else if !manual && self.profiles.iter().all(|p| p.coords.is_empty()) && self.basemaps.is_empty() {
-            painter.text(rect.center(), Align2::CENTER_CENTER, "No GPS tracks yet.\nImport profiles with GPS, or add a GeoTIFF basemap.", FontId::proportional(13.0), weak);
+        } else if !manual && self.profiles.iter().all(|p| p.coords.is_empty()) && self.basemaps.is_empty() && self.shapefiles.is_empty() {
+            painter.text(rect.center(), Align2::CENTER_CENTER, "No GPS tracks yet.\nImport profiles with GPS, or add a basemap.", FontId::proportional(13.0), weak);
         }
         // Scale bar
         let geo = !manual && self.is_geographic();

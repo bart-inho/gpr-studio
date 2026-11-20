@@ -40,6 +40,13 @@ struct ProjBasemap {
 }
 
 #[derive(Serialize, Deserialize)]
+struct ProjShapefile {
+    path: PathBuf,
+    crs: CrsSpec,
+    visible: bool,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct ProjFile {
     version: u32,
     crs: CrsSpec,
@@ -48,6 +55,8 @@ pub struct ProjFile {
     markers: Vec<Marker>,
     lines: Vec<LinePick>,
     basemaps: Vec<ProjBasemap>,
+    #[serde(default)]
+    shapefiles: Vec<ProjShapefile>,
     next_pick_id: u32,
     import: crate::formats::ImportOptions,
     #[serde(default = "crate::interp::yes")]
@@ -140,6 +149,7 @@ fn build(app: &App, base: Option<&Path>) -> ProjFile {
         markers: app.markers.clone(),
         lines: app.lines.clone(),
         basemaps: app.basemaps.iter().map(|b| ProjBasemap { path: rel(base, &b.path), crs: b.crs.clone(), visible: b.visible, opacity: b.opacity }).collect(),
+        shapefiles: app.shapefiles.iter().map(|s| ProjShapefile { path: rel(base, &s.path), crs: s.crs.clone(), visible: s.visible }).collect(),
         next_pick_id: app.next_pick_id,
         import: app.import_opts.clone(),
         show_crossings: app.show_crossings,
@@ -248,6 +258,7 @@ pub fn apply(app: &mut App, l: Loaded) -> String {
     app.markers.clear();
     app.lines.clear();
     app.basemaps.clear();
+    app.shapefiles.clear();
     app.project_crs = f.crs;
     app.map_mode = f.map_mode;
     app.manual_grid = f.manual_grid;
@@ -299,6 +310,14 @@ pub fn apply(app: &mut App, l: Loaded) -> String {
         let path = resolve(&base, &b.path);
         if path.exists() {
             app.add_basemap(path);
+        }
+    }
+    for s in f.shapefiles {
+        let path = resolve(&base, &s.path);
+        if let Ok(mut layer) = crate::shapefile::load(path, &s.crs) {
+            layer.crs = s.crs;
+            layer.visible = s.visible;
+            app.shapefiles.push(layer);
         }
     }
     app.reproject_all();
@@ -368,6 +387,17 @@ fn basemap_companions(p: &Path) -> Vec<PathBuf> {
         let key = c.to_string_lossy().to_lowercase();
         if c.is_file() && !out.iter().any(|o| o.to_string_lossy().to_lowercase() == key) {
             out.push(c);
+        }
+    }
+    out
+}
+
+fn shapefile_companions(p: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for ext in ["shx", "dbf", "prj", "cpg", "sbn", "sbx", "SHX", "DBF", "PRJ", "CPG", "SBN", "SBX"] {
+        let file = p.with_extension(ext);
+        if file.is_file() && !out.iter().any(|other| other.to_string_lossy().eq_ignore_ascii_case(&file.to_string_lossy())) {
+            out.push(file);
         }
     }
     out
@@ -453,6 +483,13 @@ pub fn plan_collect(app: &App, folder: &Path, name: &str) -> CollectJob {
         job.moved.push((b.path.clone(), pairs[0].1.clone()));
         job.copies.extend(pairs);
     }
+    for s in &app.shapefiles {
+        if job.moved.iter().any(|(src, _)| *src == s.path) { continue; }
+        if !s.path.is_file() { job.missing.push(s.path.display().to_string()); continue; }
+        let pairs = place(&s.path, &shapefile_companions(&s.path), &maps, &mut used);
+        job.moved.push((s.path.clone(), pairs[0].1.clone()));
+        job.copies.extend(pairs);
+    }
     // A file already in place (collecting into the same folder again) is not copied onto itself.
     job.copies.retain(|(src, dst)| !same_file(src, dst));
     job
@@ -523,6 +560,9 @@ pub fn finish_collect(app: &mut App, job: CollectJob, r: CollectResult, cancelle
         for (saved, live) in file.basemaps.iter_mut().zip(&app.basemaps) {
             saved.path = rel(job.project.parent(), &remap_path(&live.path));
         }
+        for (saved, live) in file.shapefiles.iter_mut().zip(&app.shapefiles) {
+            saved.path = rel(job.project.parent(), &remap_path(&live.path));
+        }
         match save_file(&file, &job.project) {
             Ok(()) => {
                 for p in &mut app.profiles {
@@ -530,6 +570,7 @@ pub fn finish_collect(app: &mut App, job: CollectJob, r: CollectResult, cancelle
                     if let Some(gps) = &mut p.gps { gps.source = remap_gps(&gps.source); }
                 }
                 for b in &mut app.basemaps { b.path = remap_path(&b.path); }
+                for s in &mut app.shapefiles { s.path = remap_path(&s.path); }
                 app.saved_snapshot = Some(snapshot(app));
                 if app.remember_projects {
                     crate::settings::set_last_project(&job.project);
@@ -920,7 +961,7 @@ mod performance_measurements {
         }).collect();
         let file = ProjFile {
             version: 2, crs: CrsSpec::Epsg(2056), profiles,
-            marker_types: crate::model::default_marker_types(), markers: vec![], lines: vec![], basemaps: vec![],
+            marker_types: crate::model::default_marker_types(), markers: vec![], lines: vec![], basemaps: vec![], shapefiles: vec![],
             next_pick_id: 1, import, show_crossings: true, zones: vec![], interp: Default::default(), map_mode: MapMode::Gps, manual_grid: None,
         };
         let t = Instant::now();
